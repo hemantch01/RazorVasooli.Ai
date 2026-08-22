@@ -11,4 +11,51 @@
 
 import { dbEnabled, dbGetSetting, dbSetSetting } from "./db.js";
 
-// TODO: complete implementation step 12
+export type AgentMode = "agentic" | "control";
+
+const MODE_KEY = "agent_mode";
+let memoryMode: AgentMode = "agentic";
+let hydrated = false;
+
+/** Load persisted settings into memory at boot. */
+export async function hydrateSettings(): Promise<void> {
+  if (!dbEnabled() || hydrated) return;
+  try {
+    const value = await dbGetSetting(MODE_KEY);
+    if (value === "agentic" || value === "control") {
+      memoryMode = value;
+      console.log(`[Settings] ♻️ Restored agent mode from DB: ${value}`);
+    }
+    hydrated = true;
+  } catch (err) {
+    console.warn("[Settings] hydrate failed:", (err as Error).message);
+  }
+}
+
+export async function getAgentMode(): Promise<AgentMode> {
+  if (dbEnabled()) {
+    try {
+      const value = await dbGetSetting(MODE_KEY);
+      if (value === "agentic" || value === "control") {
+        memoryMode = value;
+        return value;
+      }
+    } catch {
+      /* fall through to memory */
+    }
+  }
+  return memoryMode;
+}
+
+/** Persist a new mode. Returns the effective mode. */
+export async function setAgentMode(mode: AgentMode): Promise<AgentMode> {
+  memoryMode = mode;
+  if (dbEnabled()) {
+    try {
+      await dbSetSetting(MODE_KEY, mode);
+    } catch (err) {
+      console.warn("[Settings] persist failed:", (err as Error).message);
+    }
+  }
+  return mode;
+}
