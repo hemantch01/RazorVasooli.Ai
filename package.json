@@ -48,6 +48,7 @@
     "concurrently": "^10.0.5",
     "oxlint": "^1.75.0",
     "postcss": "^8.5.26",
+    "prisma": "^6.19.3",
     "tailwindcss": "^3.4.19",
     "tsx": "^4.23.12",
     "typescript": "~6.0.2",
