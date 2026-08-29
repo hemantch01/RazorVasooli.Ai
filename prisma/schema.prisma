@@ -30,5 +30,133 @@ model User {
   createdAt    DateTime @default(now())
 }
 
+model RecoveryCase {
+  id        String   @id
+  state     String
+  amount    Float
+  snapshot  Json
+  updatedAt DateTime @updatedAt
+}
 
-// TODO: complete implementation step 65
+model ScheduledJob {
+  id        String   @id
+  caseId    String
+  type      String
+  executeAt DateTime
+  status    String   @default("scheduled") // scheduled | fired | cancelled
+  payload   Json     @default("{}")
+  createdAt DateTime @default(now())
+
+  @@index([status, executeAt])
+}
+
+model Intervention {
+  id          String   @id
+  caseId      String
+  channel     String
+  subject     String?
+  body        String
+  paymentLink String?
+  sentAt      DateTime @default(now())
+}
+
+model WebhookLog {
+  id                String   @id
+  event             String
+  payload           Json
+  receivedAt        DateTime @default(now())
+  signatureVerified Boolean  @default(false)
+  aiAction          String?
+  paymentLink       String?
+
+  @@index([receivedAt(sort: Desc)])
+}
+
+model SimulatorBatch {
+  id          String   @id
+  label       String
+  agentOn     Boolean
+  seed        BigInt
+  summary     Json
+  results     Json
+  completedAt DateTime @default(now())
+}
+
+model TelegramSession {
+  chatId    BigInt   @id
+  data      Json
+  updatedAt DateTime @updatedAt
+}
+
+model MailConversation {
+  email     String   @id
+  data      Json
+  updatedAt DateTime @updatedAt
+}
+
+model MandateRetry {
+  mandateKey  String   @id
+  retriesUsed Int      @default(0)
+  lastReason  String?
+  nextAction  String?
+  updatedAt   DateTime @updatedAt
+}
+
+// ── Hardening Phase H1 ───────────────────────────────────────────────────────
+
+/// DPDP Act opt-out registry — durable so customers who exercised their data
+/// protection rights are NEVER re-contacted after a server restart.
+model DpdpOptOut {
+  email      String   @id
+  optedOutAt DateTime @default(now())
+}
+
+/// Generic key/value system settings (kill-switch mode etc.) — survives restarts.
+model SystemSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+// ── Learning loop (Phase L1) ─────────────────────────────────────────────────
+
+/// Aggregated intervention outcomes keyed by "{category}|{channel}|{attempt}".
+/// The policy engine reads these to rank channels by measured recovery rate.
+model OutcomeStat {
+  key        String   @id
+  attempted  Int      @default(0)
+  recovered  Int      @default(0)
+  updatedAt  DateTime @updatedAt
+}
+
+/// Raw per-intervention outcome log (audit-friendly, powers the stats table).
+model LearningEvent {
+  id              String   @id @default(cuid())
+  category        String
+  channel         String
+  attempt         Int
+  recovered       Boolean
+  amountInr       Float?
+  discountPercent Int?
+  customerSegment String?
+  source          String   @default("live") // seed | live | simulator | webhook
+  createdAt       DateTime @default(now())
+
+  @@index([category, channel])
+}
+
+/// Phase L2: Vector embeddings for similar-case RAG retrieval.
+/// Stores one embedding per resolved case (narrative + transcript digest).
+model CaseEmbedding {
+  caseId     String   @id
+  category   String
+  channel    String              // winning channel
+  recovered  Boolean
+  amountInr  Float
+  discount   Int      @default(0)
+  narrative  String              // human-readable case summary
+  // vector column added via raw SQL migration (pgvector)
+  createdAt  DateTime @default(now())
+
+  @@index([category])
+}
