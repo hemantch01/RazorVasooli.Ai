@@ -1,0 +1,69 @@
+# RazorVasooli.Ai — Infrastructure Stack
+# Dev (host hot-reload):  docker compose up -d postgres redis mailpit  →  npm run dev:all
+# Full containerized run: docker compose up -d --build                 →  http://127.0.0.1:5000
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: razorvasooli-postgres
+    environment:
+      POSTGRES_USER: razorvasooli
+      POSTGRES_PASSWORD: razorvasooli
+      POSTGRES_DB: razorvasooli
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U razorvasooli"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Phase H1: BullMQ backing store for durable risk-event processing
+  redis:
+    image: redis:7-alpine
+    container_name: razorvasooli-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: razorvasooli-mailpit
+    ports:
+      - "8025:8025"   # Web UI → http://localhost:8025 (view delivered emails)
+      - "1025:1025"   # SMTP  → point SMTP_HOST=localhost SMTP_PORT=1025 here
+
+  # Phase H1: the app itself, containerized (serves API + built SPA on :5000)
+  app:
+    build: .
+    container_name: razorvasooli-app
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://razorvasooli:razorvasooli@postgres:5432/razorvasooli
+      REDIS_URL: redis://redis:6379
+      SMTP_HOST: mailpit
+      SMTP_PORT: 1025
+      HOST: 0.0.0.0
+      PORT: 5000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
