@@ -6,7 +6,7 @@ import { OrchestratorService } from "../services/orchestrator.js";
 import { AuditService } from "../services/audit.js";
 
 // Moving state out of module scope and into a shared container/repository structure
-export const trackedInvoices = [
+export const trackedInvoices = process.env.DEMO_STATIC_SEED === "true" ? [
   {
     id: "inv_Rz4k8mPqN2x7Lb",
     customerName: "A***a Sharma",
@@ -51,7 +51,7 @@ export const trackedInvoices = [
     retryCount: 0,
     channel: "whatsapp",
   },
-];
+] : [];
 
 export interface Container {
   razorpayClient: Razorpay | null;

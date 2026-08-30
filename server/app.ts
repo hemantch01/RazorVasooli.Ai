@@ -26,6 +26,7 @@ import { registerAuditrRoutes } from "./routes/auditRRoutes.js";
 import { registerSystemRoutes } from "./routes/systemRoutes.js";
 import { registerAnalyticsRoutes } from "./routes/analyticsRoutes.js";
 import { registerLearningRoutes } from "./routes/learningRoutes.js";
+import { registerSimulatorRoutes } from "./routes/simulatorRoutes.js";
 
 import type { Container } from "./core/container.js";
 import { startPoller, pollInvoices } from "./workers/invoicePoller.js";
@@ -33,13 +34,20 @@ import { pollerState } from "./workers/invoicePoller.js";
 
 export function buildApp(container: Container, contextRefs: { telegramAgent: any, runRecoveryPipeline: any }) {
   const app = express();
+  app.set("trust proxy", 1);
 
   // Security: Rate limiting
   const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 200,
+    max: 600, // Raised to 600 to accommodate Dashboard polling
     standardHeaders: true,
     legacyHeaders: false,
+    skip: (req) => {
+      const path = req.path;
+      if (path.startsWith("/api/webhooks") || path.startsWith("/api/telegram") || path === "/api/health" || path === "/api/ready") return true;
+      if (req.headers.cookie?.includes("rv_token=")) return true; // Skip limit for authenticated users
+      return false;
+    },
     message: { error: "Too many requests, please try again later." },
   });
 
@@ -117,6 +125,7 @@ export function buildApp(container: Container, contextRefs: { telegramAgent: any
   registerSystemRoutes(app, ctx);
   registerAnalyticsRoutes(app, ctx);
   registerLearningRoutes(app, ctx);
+  registerSimulatorRoutes(app, ctx);
 
   // Serve SPA in production
   if (process.env.NODE_ENV === "production") {

@@ -263,13 +263,13 @@ export async function dbUpsertMandate(mandateKey: string, updates: {
 }
 
 export async function dbLoadBatches(): Promise<Array<{
-  id: string; label: string; agent_on: boolean; seed: bigint;
+  id: string; label: string; agent_on: boolean; seed: string;
   summary: Record<string, unknown>; results: unknown[]; updated_at?: Date;
 }>> {
   if (!dbEnabled()) return [];
   const rows = await getPrisma().simulatorBatch.findMany({ orderBy: { completedAt: "desc" }, take: 50 });
   return rows.map((r) => ({
-    id: r.id, label: r.label, agent_on: r.agentOn, seed: r.seed,
+    id: r.id, label: r.label, agent_on: r.agentOn, seed: r.seed.toString(),
     summary: r.summary as Record<string, unknown>,
     results: (r.results as unknown[]) || [],
   }));
@@ -374,7 +374,7 @@ export async function dbSaveLearningEvents(events: Array<{
 
 // RAG Embeddings (Phase L2)
 
-export async function dbUpsertEmbedding(
+export async function dbUpsertCaseEmbedding(
   caseId: string,
   category: string,
   channel: string,
@@ -382,27 +382,39 @@ export async function dbUpsertEmbedding(
   amountInr: number,
   discount: number,
   narrative: string,
-  embedding: number[]
+  embedding?: number[]
 ): Promise<void> {
   if (!dbEnabled()) return;
   
-  // Format the array as a Postgres vector literal: '[1.1, 2.2, 3.3]'
-  const vectorLiteral = `[${embedding.join(',')}]`;
-  
   try {
-    // Prisma does not fully support vector types in upsert, so we use executeRaw
-    await getPrisma().$executeRaw`
-      INSERT INTO "CaseEmbedding" ("caseId", category, channel, recovered, "amountInr", discount, narrative, embedding)
-      VALUES (${caseId}, ${category}, ${channel}, ${recovered}, ${amountInr}, ${discount}, ${narrative}, ${vectorLiteral}::vector)
-      ON CONFLICT ("caseId") DO UPDATE SET
-        category = EXCLUDED.category,
-        channel = EXCLUDED.channel,
-        recovered = EXCLUDED.recovered,
-        "amountInr" = EXCLUDED."amountInr",
-        discount = EXCLUDED.discount,
-        narrative = EXCLUDED.narrative,
-        embedding = EXCLUDED.embedding
-    `;
+    if (embedding && embedding.length === 768) {
+      const vectorLiteral = `[${embedding.join(',')}]`;
+      await getPrisma().$executeRaw`
+        INSERT INTO "CaseEmbedding" ("caseId", category, channel, recovered, "amountInr", discount, narrative, embedding)
+        VALUES (${caseId}, ${category}, ${channel}, ${recovered}, ${amountInr}, ${discount}, ${narrative}, ${vectorLiteral}::vector)
+        ON CONFLICT ("caseId") DO UPDATE SET
+          category = EXCLUDED.category,
+          channel = EXCLUDED.channel,
+          recovered = EXCLUDED.recovered,
+          "amountInr" = EXCLUDED."amountInr",
+          discount = EXCLUDED.discount,
+          narrative = EXCLUDED.narrative,
+          embedding = EXCLUDED.embedding
+      `;
+    } else {
+      await getPrisma().$executeRaw`
+        INSERT INTO "CaseEmbedding" ("caseId", category, channel, recovered, "amountInr", discount, narrative, embedding)
+        VALUES (${caseId}, ${category}, ${channel}, ${recovered}, ${amountInr}, ${discount}, ${narrative}, NULL)
+        ON CONFLICT ("caseId") DO UPDATE SET
+          category = EXCLUDED.category,
+          channel = EXCLUDED.channel,
+          recovered = EXCLUDED.recovered,
+          "amountInr" = EXCLUDED."amountInr",
+          discount = EXCLUDED.discount,
+          narrative = EXCLUDED.narrative,
+          embedding = EXCLUDED.embedding
+      `;
+    }
   } catch (err: any) {
     console.warn(`[DB] Embedding upsert failed for ${caseId}:`, err?.message);
   }
@@ -433,7 +445,8 @@ export async function dbFindSimilar(
         "caseId", category, channel, recovered, "amountInr", discount, narrative,
         1 - (embedding <=> $1::vector) AS similarity
       FROM "CaseEmbedding"
-      WHERE ($2::text IS NULL OR category = $2::text)
+      WHERE embedding IS NOT NULL
+        AND ($2::text IS NULL OR category = $2::text OR category = 'unknown')
         AND 1 - (embedding <=> $1::vector) >= $3::float
       ORDER BY embedding <=> $1::vector
       LIMIT $4::integer
@@ -493,3 +506,108 @@ export async function dbLoadWebhookLogs(limit = 50): Promise<Array<any>> {
     return [];
   }
 }
+
+// ── Registered Payment Links Persistence ────────────────────────────────────
+
+export interface DbPaymentLink {
+  id: string;
+  shortUrl: string;
+  amountInr: number;
+  customerName?: string | null;
+  customerEmail?: string | null;
+  customerPhone?: string | null;
+  caseId?: string | null;
+  notes?: string | null;
+  status?: string;
+  simulated?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export async function dbSaveRegisteredPaymentLink(link: DbPaymentLink): Promise<DbPaymentLink | null> {
+  if (!dbEnabled()) return link;
+  try {
+    const record = await getPrisma().registeredPaymentLink.upsert({
+      where: { id: link.id },
+      update: {
+        shortUrl: link.shortUrl,
+        amountInr: link.amountInr,
+        customerName: link.customerName || null,
+        customerEmail: link.customerEmail || null,
+        customerPhone: link.customerPhone || null,
+        caseId: link.caseId || null,
+        notes: link.notes || null,
+        status: link.status || "created",
+        simulated: link.simulated || false,
+      },
+      create: {
+        id: link.id,
+        shortUrl: link.shortUrl,
+        amountInr: link.amountInr,
+        customerName: link.customerName || null,
+        customerEmail: link.customerEmail || null,
+        customerPhone: link.customerPhone || null,
+        caseId: link.caseId || null,
+        notes: link.notes || null,
+        status: link.status || "created",
+        simulated: link.simulated || false,
+      },
+    });
+    return {
+      id: record.id,
+      shortUrl: record.shortUrl,
+      amountInr: record.amountInr,
+      customerName: record.customerName,
+      customerEmail: record.customerEmail,
+      customerPhone: record.customerPhone,
+      caseId: record.caseId,
+      notes: record.notes,
+      status: record.status,
+      simulated: record.simulated,
+      createdAt: record.createdAt.toISOString(),
+      updatedAt: record.updatedAt.toISOString(),
+    };
+  } catch (err: any) {
+    console.error("[DB] Failed to save registered payment link:", err?.message);
+    return link;
+  }
+}
+
+export async function dbLoadRegisteredPaymentLinks(limit = 100): Promise<DbPaymentLink[]> {
+  if (!dbEnabled()) return [];
+  try {
+    const rows = await getPrisma().registeredPaymentLink.findMany({
+      orderBy: { createdAt: "desc" },
+      take: limit,
+    });
+    return rows.map((r) => ({
+      id: r.id,
+      shortUrl: r.shortUrl,
+      amountInr: r.amountInr,
+      customerName: r.customerName,
+      customerEmail: r.customerEmail,
+      customerPhone: r.customerPhone,
+      caseId: r.caseId,
+      notes: r.notes,
+      status: r.status,
+      simulated: r.simulated,
+      createdAt: r.createdAt.toISOString(),
+      updatedAt: r.updatedAt.toISOString(),
+    }));
+  } catch (err: any) {
+    console.error("[DB] Failed to load registered payment links:", err?.message);
+    return [];
+  }
+}
+
+export async function dbDeleteRegisteredPaymentLink(id: string): Promise<boolean> {
+  if (!dbEnabled()) return true;
+  try {
+    await getPrisma().registeredPaymentLink.delete({ where: { id } });
+    return true;
+  } catch (err: any) {
+    console.error("[DB] Failed to delete registered payment link:", err?.message);
+    return false;
+  }
+}
+

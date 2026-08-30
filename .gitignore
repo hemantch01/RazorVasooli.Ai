@@ -27,6 +27,4 @@ server.log
 .final_state
 .env
 generate_history.mjs
-
-tsconfig.server.tsbuildinfo
-.env
+*.tsbuildinfo

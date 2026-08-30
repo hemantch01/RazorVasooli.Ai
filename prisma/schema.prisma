@@ -160,3 +160,22 @@ model CaseEmbedding {
 
   @@index([category])
 }
+
+/// Dashboard Registered Payment Links — durable repository for merchant/admin payment links
+model RegisteredPaymentLink {
+  id            String   @id
+  shortUrl      String
+  amountInr     Float
+  customerName  String?
+  customerEmail String?
+  customerPhone String?
+  caseId        String?
+  notes         String?
+  status        String   @default("created")
+  simulated     Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([amountInr])
+}
+

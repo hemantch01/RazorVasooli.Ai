@@ -137,7 +137,6 @@ const OPEN_PATHS = [
   "/api/telegram/webhook",
   "/api/ingestion/beacon",
   "/api/replies/inbound",
-  "/api/replies/action/",
 ];
 
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {

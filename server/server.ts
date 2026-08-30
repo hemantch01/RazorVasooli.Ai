@@ -19,9 +19,8 @@ import { pollInbox, startImapPolling, ensureMailHydrated } from "./services/mail
 import { initQueue, getQueueStats } from "./core/queue.js";
 import { hydrateSettings } from "./core/settings.js";
 import { loadDpdpOptOuts } from "./services/orchestrator.js";
-import { hydrateOutcomeMemory } from "./services/outcomeMemory.js";
 import { startPoller } from "./workers/invoicePoller.js";
-import { buildActionUrls, createRecoveryPaymentLink, createSubscriptionUpdateMethodLink, sendInterventionMessage, type OutboxChannel } from "./services/channels.js";
+import { buildActionUrls, createSubscriptionUpdateMethodLink, getOrCreateRecoveryPaymentLink, sendInterventionMessage } from "./services/channels.js";
 import { registerEventHandlers } from "./services/eventHandlers.js";
 
 async function bootstrap() {
@@ -110,12 +109,7 @@ async function bootstrap() {
     await hydrateSettings();
     await initQueue((event) => container.riskEventBus.publish(event));
 
-    try {
-      const n = await hydrateOutcomeMemory();
-      if (n === 0) console.log("[Learning] 💤 Memory cold — POST /api/learning/seed to bootstrap with synthetic personas");
-    } catch (err) {
-      console.warn("[Learning] hydration skipped:", (err as Error).message);
-    }
+
 
     try {
       await ensureDefaultAdmin();
@@ -123,17 +117,65 @@ async function bootstrap() {
       console.warn("[Auth] default admin seeding skipped:", err?.message);
     }
 
-    // 5. Wire Up Orchestrator Actions (Channels)
+    // 5. Wire Up Orchestrator Actions (Channels & Transcripts)
+    container.orchestrator.setConversationProvider((caseId: string) => {
+      const entries = container.auditService.getEntries({ limit: 2000 })
+        .filter((e) => e.payload && (e.payload.caseId === caseId || (e.payload as any).case_id === caseId))
+        .sort((a, b) => a.seq - b.seq);
+
+      if (entries.length === 0) return "";
+
+      const lines: string[] = [];
+      for (const entry of entries) {
+        if (entry.eventType === "customer.reply") {
+          const ch = entry.payload.channel || "inbound";
+          const text = entry.payload.message || entry.payload.messagePreview || "";
+          lines.push(`[CUSTOMER via ${ch}] ${text}`);
+        } else if (entry.eventType === "intervention.executed") {
+          const ch = entry.payload.channel || "outbound";
+          const msg = entry.payload.customMessage || entry.payload.message || (entry.payload.paymentLink ? `Payment link: ${entry.payload.paymentLink}` : "");
+          lines.push(`[AGENT via ${ch}] ${msg}`);
+        } else if (entry.eventType === "policy.decision") {
+          lines.push(`[DECISION] ${entry.payload.narration || ""}`);
+        } else if (entry.eventType === "promise.recorded") {
+          lines.push(`[PROMISE] Customer promised payment on ${entry.payload.promisedDate}`);
+        }
+      }
+
+      return lines.join("\n");
+    });
+
+    container.orchestrator.setPromiseReminderProvider(async (caseData) => {
+      const date = caseData.promise?.promisedDate || "today";
+      const fallback = `Namaste ji, aapne ${date} tak payment ka promise kiya tha. Aaj woh date aa gayi hai—kya aap abhi payment complete kar sakte hain? {{PAYMENT_LINK}}`;
+      try {
+        const message = await container.policyService.composePromiseReminder({
+          caseId: caseData.id,
+          customerName: caseData.customerName,
+          amount: caseData.amount,
+          promisedDate: date,
+          transcript: container.auditService.getEntries({ limit: 2000 })
+            .filter((e) => e.payload?.caseId === caseData.id)
+            .map((e) => String(e.payload?.message || e.payload?.messagePreview || ""))
+            .filter(Boolean)
+            .slice(-6),
+        });
+        return message || fallback;
+      } catch (err) {
+        console.warn(`[Orchestrator] Promise-reminder generation failed for ${caseData.id}:`, (err as Error).message);
+        return fallback;
+      }
+    });
+
     container.orchestrator.setInterventionHandler(async (caseData, job) => {
-      const channel = job.channel || "email";
       const baseUrl = process.env.PUBLIC_BASE_URL || `http://${HOST}:${PORT}`;
 
-      const linkResult = caseData.subscriptionId && channel === "subscription_update_link"
-        ? await createSubscriptionUpdateMethodLink(container.razorpayClient, {
+      const linkOutcome = caseData.subscriptionId && job.channel === "subscription_update_link"
+        ? { link: await createSubscriptionUpdateMethodLink(container.razorpayClient, {
             subscriptionId: caseData.subscriptionId,
             customerEmail: caseData.customerEmail,
-          })
-        : await createRecoveryPaymentLink(container.razorpayClient, {
+          }), reused: false }
+        : await getOrCreateRecoveryPaymentLink(container.razorpayClient, caseData.paymentLink, {
             amountInr: caseData.amount,
             customerName: caseData.customerName,
             customerEmail: caseData.customerEmail,
@@ -141,34 +183,61 @@ async function bootstrap() {
             description: `RazorVasooli recovery for ${caseData.id}`,
             notes: { case_id: caseData.id },
           });
+      const linkResult = linkOutcome.link;
+      if (!caseData.subscriptionId || job.channel !== "subscription_update_link") {
+        container.orchestrator.recordPaymentLink(caseData.id, linkResult);
+      }
 
-      const outboxChannel: OutboxChannel = channel === "email" ? "email" : channel === "sms" ? "sms" : "whatsapp";
+      const deliveredChannels: string[] = [];
 
-      const msg = sendInterventionMessage({
-        channel: outboxChannel,
-        caseId: caseData.id,
-        customerName: caseData.customerName || "Customer",
-        customerEmail: caseData.customerEmail,
-        customerPhone: caseData.customerPhone,
-        amountInr: caseData.amount,
-        declineCode: caseData.declineCode,
-        discountPercent: job.discountPercent,
-        paymentLink: linkResult.shortUrl,
-        actionUrls: buildActionUrls(baseUrl, caseData.id),
-      });
+      // 1. Deliver to Email (if customerEmail exists)
+      if (caseData.customerEmail) {
+        sendInterventionMessage({
+          channel: "email",
+          caseId: caseData.id,
+          customerName: caseData.customerName || "Customer",
+          customerEmail: caseData.customerEmail,
+          customerPhone: caseData.customerPhone,
+          amountInr: caseData.amount,
+          declineCode: caseData.declineCode,
+          discountPercent: job.discountPercent,
+          customMessage: job.customMessage,
+          paymentLink: linkResult.shortUrl,
+          paymentLinkId: linkResult.linkId,
+          simulated: linkResult.simulated,
+          actionUrls: buildActionUrls(baseUrl, caseData.id),
+        });
+        deliveredChannels.push("email");
+      }
+
+      // 2. Deliver to Telegram (simultaneous push if customerPhone exists and agent is active)
+      if (contextRefs.telegramAgent && caseData.customerPhone) {
+        const telegramDelivered = await contextRefs.telegramAgent.pushWebhookIntervention({
+          caseId: caseData.id,
+          amountInr: caseData.amount,
+          declineCode: caseData.declineCode,
+          paymentLink: linkResult.shortUrl,
+          paymentLinkId: linkResult.linkId,
+          simulated: linkResult.simulated,
+          customerContact: caseData.customerPhone,
+          customMessage: job.customMessage,
+        });
+        if (telegramDelivered) deliveredChannels.push("telegram");
+      }
 
       container.auditService.append("intervention.executed", {
         caseId: caseData.id,
         jobId: job.id,
-        channel,
+        channel: deliveredChannels.join(",") || "none",
         attempt: caseData.attemptCount,
         amount: caseData.amount,
         paymentLink: linkResult.shortUrl,
+        paymentLinkReused: linkOutcome.reused,
+        customMessage: job.customMessage,
         simulated: linkResult.simulated,
-        messageId: msg.id,
       });
 
-      console.log(`[Channels] ✅ Intervention executed for ${caseData.id} via ${channel} → ${linkResult.shortUrl}`);
+      console.log(`[Channels] Intervention dispatched for ${caseData.id} via ${deliveredChannels.join(" + ") || "no channel"} → ${linkResult.shortUrl}`);
     });
 
     // 6. Register Event Handlers
@@ -178,7 +247,7 @@ async function bootstrap() {
       policyService: container.policyService,
       orchestrator: container.orchestrator,
       auditService: container.auditService,
-      telegramAgent: contextRefs.telegramAgent // Will be updated if started below
+      getTelegramAgent: () => contextRefs.telegramAgent
     });
     contextRefs.runRecoveryPipeline = runRecoveryPipeline;
 
@@ -190,6 +259,8 @@ async function bootstrap() {
       token: process.env.TELEGRAM_BOT_TOKEN,
       webhookUrl: process.env.TELEGRAM_WEBHOOK_URL,
       webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET,
+      orchestrator: container.orchestrator,
+      policyService: container.policyService,
     });
     setTelegramAgent(contextRefs.telegramAgent);
     setGlobalTelegramAgent(contextRefs.telegramAgent);
@@ -203,6 +274,8 @@ async function bootstrap() {
       razorpayClient: container.razorpayClient,
       auditService: container.auditService,
       geminiApiKey: process.env.GEMINI_API_KEY,
+      orchestrator: container.orchestrator,
+      policyService: container.policyService,
     };
     startImapPolling(emailDeps);
     void pollInbox(emailDeps);

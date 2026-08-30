@@ -4,7 +4,7 @@ set -e
 
 if [ -n "$DATABASE_URL" ]; then
   echo "[Entrypoint] Applying Prisma migrations..."
-  npx prisma migrate deploy || echo "[Entrypoint] ⚠️ migrate deploy failed (first run without migrations?) — continuing"
+  npx prisma migrate deploy || exit 1
 fi
 
 exec npx tsx server/index.ts
