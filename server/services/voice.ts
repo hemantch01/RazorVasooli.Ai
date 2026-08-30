@@ -118,73 +118,78 @@ export async function generateGeminiVoiceResponse(
 ): Promise<VoiceGenerationResult> {
   const { script, englishTranslation } = generateHinglishVoiceScript(ctx);
   const apiKey = geminiApiKey || process.env.GEMINI_API_KEY;
+  const ttsModels = [
+    "gemini-3.1-flash-tts-preview",
+    "gemini-2.5-flash-preview-tts",
+    "gemini-2.5-flash-lite-preview-tts",
+    "gemini-2.5-pro-preview-tts",
+  ];
 
   if (apiKey && !apiKey.includes("mock") && !apiKey.includes("YourKey")) {
-    try {
-      // Dedicated TTS model — audio output is raw L16 PCM at 24kHz.
-      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`;
+    for (const model of ttsModels) {
+      try {
+        const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
-      const payload = {
-        contents: [
-          {
-            parts: [
-              {
-                text: `Speak this as a polite, empathetic Indian revenue recovery voice agent named RazorVasooli, with a warm, professional, respectful tone in natural Hinglish:\n\n"${script}"`,
-              },
-            ],
-          },
-        ],
-        generationConfig: {
-          responseModalities: ["AUDIO"],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: {
-                voiceName: "Aoede", // Conversational, warm voice
+        const payload = {
+          contents: [
+            {
+              parts: [
+                {
+                  text: `Speak this as a polite, empathetic Indian revenue recovery voice agent named RazorVasooli, with a warm, professional, respectful tone in natural Hinglish:\n\n"${script}"`,
+                },
+              ],
+            },
+          ],
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: "Aoede", // Conversational, warm voice
+                },
               },
             },
           },
-        },
-      };
+        };
 
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
 
-      if (res.ok) {
-        const data = (await res.json()) as any;
-        const candidate = data.candidates?.[0];
-        const parts = candidate?.content?.parts || [];
+        if (res.ok) {
+          const data = (await res.json()) as any;
+          const candidate = data.candidates?.[0];
+          const parts = candidate?.content?.parts || [];
 
-        // Check if inline audio data was returned
-        const audioPart = parts.find((p: any) => p.inlineData && p.inlineData.mimeType?.startsWith("audio/"));
-        if (audioPart) {
-          const mimeType: string = audioPart.inlineData.mimeType || "audio/wav";
-          let audioBase64: string = audioPart.inlineData.data;
+          // Check if inline audio data was returned
+          const audioPart = parts.find((p: any) => p.inlineData && p.inlineData.mimeType?.startsWith("audio/"));
+          if (audioPart) {
+            const mimeType: string = audioPart.inlineData.mimeType || "audio/wav";
+            let audioBase64: string = audioPart.inlineData.data;
 
-          // Gemini returns headerless raw PCM (audio/L16;codec=pcm;rate=24000).
-          // Browsers can't play that — wrap it in a WAV container first.
-          if (/L16|pcm/i.test(mimeType)) {
-            const rateMatch = mimeType.match(/rate=(\d+)/i);
-            const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 24000;
-            audioBase64 = pcmToWavBase64(Buffer.from(audioPart.inlineData.data, "base64"), sampleRate);
+            if (/L16|pcm/i.test(mimeType)) {
+              const rateMatch = mimeType.match(/rate=(\d+)/i);
+              const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 24000;
+              audioBase64 = pcmToWavBase64(Buffer.from(audioPart.inlineData.data, "base64"), sampleRate);
+            }
+
+            return {
+              script,
+              englishTranslation,
+              audioBase64,
+              mimeType: "audio/wav",
+              provider: "gemini_direct_audio",
+              suggestedAction: "Sent Hinglish voice recovery call via Gemini Audio Modality",
+            };
           }
-
-          return {
-            script,
-            englishTranslation,
-            audioBase64,
-            mimeType: "audio/wav",
-            provider: "gemini_direct_audio",
-            suggestedAction: "Sent Hinglish voice recovery call via Gemini Audio Modality",
-          };
+        } else {
+          console.warn(`[Voice] Model ${model} TTS non-200: ${res.status}`);
         }
-      } else {
-        console.warn("[Voice] Gemini API audio generation non-200:", await res.text());
+      } catch (err: any) {
+        console.warn(`[Voice] Model ${model} TTS failed:`, err?.message || err);
       }
-    } catch (err: any) {
-      console.warn("[Voice] Gemini Audio API call failed, falling back to synthetic audio:", err?.message || err);
     }
   }
 
@@ -230,12 +235,13 @@ export function parseHinglishReply(message: string): HinglishParseResult {
     };
   }
 
-  // Pattern 2: Payment Promise (Payday / Date-specific)
-  const promiseDateMatch = normalized.match(/(\d{1,2})\s*(tarikh|tareekh|th|st|nd|rd)?/);
-  const salaryMatch = normalized.includes("salary") || normalized.includes("paise aane do") || normalized.includes("tankhwa");
-  const tomorrowMatch = normalized.includes("kal") || normalized.includes("tomorrow") || normalized.includes("agle hafte");
+  // Pattern 2: Payment Promise (Payday / Date-specific with explicit keywords)
+  const promiseDateMatch = normalized.match(/\b([1-9]|[12]\d|3[01])\s*(?:tarikh|tareekh|th|st|nd|rd)\b/);
+  const salaryMatch = /\b(salary|tankhwa|tankha|paise aane do|salary aane do|payday)\b/.test(normalized);
+  const tomorrowMatch = /\b(kal|tomorrow|agle hafte|next week|agle mahine)\b/.test(normalized);
+  const explicitPromisePhrase = /\b(pakka de dunga|pay kar dunga|payment kar dunga|kar dunga|pay karunga|bhej dunga)\b/.test(normalized);
 
-  if (salaryMatch || promiseDateMatch || tomorrowMatch || normalized.includes("pakka de dunga") || normalized.includes("pay kar dunga")) {
+  if (salaryMatch || (promiseDateMatch && explicitPromisePhrase) || (tomorrowMatch && explicitPromisePhrase)) {
     let promisedDate: string | undefined;
     const now = new Date();
 
@@ -377,41 +383,51 @@ export async function synthesizeSpeech(
   const apiKey = geminiApiKey || process.env.GEMINI_API_KEY;
   if (!apiKey || !text.trim()) return { provider: "unavailable" };
 
-  try {
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`;
-    const payload = {
-      contents: [{ parts: [{ text: `Speak this as a warm, polite Indian recovery assistant in natural Hinglish:\n\n"${text}"` }] }],
-      generationConfig: {
-        responseModalities: ["AUDIO"],
-        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } } },
-      },
-    };
-    const res = await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    if (!res.ok) {
-      console.warn("[Voice] TTS non-200:", res.status);
-      return { provider: "unavailable" };
-    }
-    const data = (await res.json()) as any;
-    const parts = data.candidates?.[0]?.content?.parts || [];
-    const audioPart = parts.find((p: any) => p.inlineData && p.inlineData.mimeType?.startsWith("audio/"));
-    if (!audioPart) return { provider: "unavailable" };
+  const ttsModels = [
+    "gemini-3.1-flash-tts-preview",
+    "gemini-2.5-flash-preview-tts",
+    "gemini-2.5-flash-lite-preview-tts",
+    "gemini-2.5-pro-preview-tts",
+  ];
 
-    const mimeType: string = audioPart.inlineData.mimeType || "audio/wav";
-    let audioBase64: string = audioPart.inlineData.data;
-    if (/L16|pcm/i.test(mimeType)) {
-      const rateMatch = mimeType.match(/rate=(\d+)/i);
-      const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 24000;
-      audioBase64 = pcmToWavBase64(Buffer.from(audioPart.inlineData.data, "base64"), sampleRate);
+  for (const model of ttsModels) {
+    try {
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      const payload = {
+        contents: [{ parts: [{ text: `Speak this as a warm, polite Indian recovery assistant in natural Hinglish:\n\n"${text}"` }] }],
+        generationConfig: {
+          responseModalities: ["AUDIO"],
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } } },
+        },
+      };
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        console.warn(`[Voice] Model ${model} TTS non-200: ${res.status}`);
+        continue;
+      }
+      const data = (await res.json()) as any;
+      const parts = data.candidates?.[0]?.content?.parts || [];
+      const audioPart = parts.find((p: any) => p.inlineData && p.inlineData.mimeType?.startsWith("audio/"));
+      if (!audioPart) continue;
+
+      const mimeType: string = audioPart.inlineData.mimeType || "audio/wav";
+      let audioBase64: string = audioPart.inlineData.data;
+      if (/L16|pcm/i.test(mimeType)) {
+        const rateMatch = mimeType.match(/rate=(\d+)/i);
+        const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 24000;
+        audioBase64 = pcmToWavBase64(Buffer.from(audioPart.inlineData.data, "base64"), sampleRate);
+      }
+      return { audioBase64, provider: "gemini_direct_audio" };
+    } catch (err: any) {
+      console.warn(`[Voice] Model ${model} synthesizeSpeech failed:`, err?.message || err);
     }
-    return { audioBase64, provider: "gemini_direct_audio" };
-  } catch (err: any) {
-    console.warn("[Voice] synthesizeSpeech failed:", err?.message || err);
-    return { provider: "unavailable" };
   }
+
+  return { provider: "unavailable" };
 }
 
 export interface VoiceNoteUnderstanding {
@@ -435,7 +451,8 @@ export async function understandVoiceNote(
   if (!apiKey) return null;
 
   try {
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${apiKey}`;
+    const transcriptionModel = process.env.GEMINI_MODEL || "gemini-3-flash-preview";
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${transcriptionModel}:generateContent?key=${apiKey}`;
     const payload = {
       contents: [
         {

@@ -20,14 +20,14 @@
  */
 
 import { parseHinglishReply, synthesizeSpeech, understandVoiceNote } from "./voice.js";
-import { dbSaveTelegramSession, dbLoadTelegramSessions } from "../core/db.js";
-import { createRecoveryPaymentLink } from "./channels.js";
+import { dbSaveTelegramSession, dbLoadTelegramSessions, dbLoadRegisteredPaymentLinks } from "../core/db.js";
+import { getOrCreateRecoveryPaymentLink } from "./channels.js";
 import type { AuditService } from "./audit.js";
 import type Razorpay from "razorpay";
 
 const MAX_DISCOUNT_PERCENT = 10;
 const MAX_TOOL_LOOPS = 5;
-const GEMINI_MODEL = "gemini-3.6-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
 
 // Session model
 
@@ -38,7 +38,8 @@ interface PaymentLinkInfo {
   shortUrl: string;
   amountInr: number;
   simulated: boolean;
-  status: "pending" | "paid";
+  status: "created" | "pending" | "partially_paid" | "paid" | "expired" | "cancelled";
+  expiresAt?: string;
   /** Phase H2: watchdog backoff state (safety net for missed webhooks) */
   checkAttempts?: number;
   nextCheckAt?: string;
@@ -66,6 +67,7 @@ interface TelegramSession {
   declineCode: string;
   discountPercent: number;
   phone?: string;
+  caseId?: string;
   promisedDate?: string;
   optedOut: boolean;
   pendingOptOut?: boolean;
@@ -93,6 +95,8 @@ export interface TelegramAgentDeps {
   token?: string;
   webhookUrl?: string;
   webhookSecret?: string;
+  orchestrator?: import("./orchestrator.js").OrchestratorService;
+  policyService?: import("./policy.js").PolicyService;
 }
 
 /** True when running in webhook transport mode (polling off). */
@@ -106,7 +110,7 @@ export class TelegramAgent {
   private pollTimer: NodeJS.Timeout | null = null;
   private statusTimer: NodeJS.Timeout | null = null;
 
-  constructor(public deps: TelegramAgentDeps) {}
+  constructor(public deps: TelegramAgentDeps) { }
 
   get enabled(): boolean {
     return !!this.deps.token;
@@ -168,13 +172,15 @@ export class TelegramAgent {
         chatId: Number(row.chat_id),
         customerName: d.customerName,
         phone: d.phone,
-        amountInr: d.amountDueInr || parseInt(process.env.SESSION_AMOUNT_INR || "2499", 10),
+        caseId: d.caseId,
+        amountInr: d.amountDueInr || parseInt(process.env.SESSION_AMOUNT_INR || "501", 10),
         declineCode: d.declineCode || "INSUFFICIENT_FUNDS",
         discountPercent: d.discountPercent || 0,
         promisedDate: d.promisedDate,
         optedOut: !!d.optedOut,
+        pendingOptOut: !!d.pendingOptOut,
         recovered: !!d.recovered,
-        voiceReplies: !!d.voiceReplies,
+        voiceReplies: d.voiceReplies === undefined ? true : !!d.voiceReplies,
         abandonedCart: d.abandonedCart,
         paymentLink: d.paymentLink,
         history: Array.isArray(d.history) ? d.history : [],
@@ -223,10 +229,11 @@ export class TelegramAgent {
         chatId,
         customerName: name || "Customer",
         amountInr: 0,
-        declineCode: "",
+        declineCode: "INSUFFICIENT_FUNDS",
         discountPercent: 0,
         optedOut: false,
         recovered: false,
+        voiceReplies: true,
         history: [],
         transcript: [],
         actions: [],
@@ -236,6 +243,35 @@ export class TelegramAgent {
       this.sessions.set(chatId, s);
     }
     return s;
+  }
+
+  /** Dynamically fetch customer dues and link directly from PostgreSQL database */
+  public async syncSessionFromDatabase(s: TelegramSession): Promise<void> {
+    try {
+      const dbLinks = await dbLoadRegisteredPaymentLinks(50);
+      let match = dbLinks.find((l) => s.phone && l.customerPhone && l.customerPhone.replace(/\D/g, "") === s.phone.replace(/\D/g, ""));
+      if (!match && s.customerName && s.customerName !== "Customer") {
+        match = dbLinks.find((l) => l.customerName && l.customerName.toLowerCase().includes(s.customerName.toLowerCase()));
+      }
+      if (!match && dbLinks.length > 0) {
+        match = dbLinks.find((l) => l.status !== "expired") || dbLinks[0];
+      }
+
+      if (match) {
+        s.amountInr = match.amountInr;
+        if (match.customerName) s.customerName = match.customerName;
+        s.paymentLink = {
+          linkId: match.id,
+          shortUrl: match.shortUrl,
+          amountInr: match.amountInr,
+          simulated: !!match.simulated,
+          status: (match.status as any) || "created",
+        };
+        if (match.caseId) s.caseId = match.caseId;
+      }
+    } catch (err: any) {
+      console.warn("[Telegram] DB dues sync error:", err?.message);
+    }
   }
 
   // Update entry point (shared by polling AND future webhook mode)
@@ -375,27 +411,59 @@ export class TelegramAgent {
   }
 
   /** Phase: Handle orchestrated webhook intervention (e.g. from policy engine) */
-  async pushWebhookIntervention(params: { amountInr: number; declineCode?: string; paymentLink: string; customerContact?: string }): Promise<boolean> {
+  async pushWebhookIntervention(params: {
+    caseId?: string;
+    amountInr: number;
+    declineCode?: string;
+    paymentLink: string;
+    paymentLinkId?: string;
+    simulated?: boolean;
+    customerContact?: string;
+    customMessage?: string;
+  }): Promise<boolean> {
     if (!params.customerContact) return false;
-    
+
     // STRICT ROUTING: normalize the incoming webhook contact
     const normalizedTarget = params.customerContact.replace(/\D/g, "");
-    
+
     // Find a session with matching verified phone number
-    const candidates = [...this.sessions.values()].filter((c) => !c.recovered && !c.optedOut && c.phone === normalizedTarget);
+    const matches = (c: TelegramSession): boolean => {
+      if (!c.phone || c.recovered || c.optedOut) return false;
+      if (c.phone === normalizedTarget) return true;
+      return normalizedTarget.length >= 10 && c.phone.endsWith(normalizedTarget.slice(-10));
+    };
+    const candidates = [...this.sessions.values()].filter(matches);
     if (candidates.length === 0) {
       console.warn(`[Telegram] No verified session found for phone ${normalizedTarget}`);
       return false;
     }
     const s = candidates[candidates.length - 1];
 
+    if (params.caseId) {
+      s.caseId = params.caseId;
+    }
     s.amountInr = params.amountInr;
     s.declineCode = params.declineCode || "PAYMENT_FAILED";
-    s.paymentLink = { linkId: "mock", shortUrl: params.paymentLink, simulated: true, amountInr: params.amountInr, status: "pending" };
+    s.paymentLink = { linkId: params.paymentLinkId || "mock", shortUrl: params.paymentLink, simulated: params.simulated ?? true, amountInr: params.amountInr, status: "pending" };
     this.persistSession(s);
 
-    const text = `Aapka ₹${params.amountInr} ka payment fail ho gaya tha (${s.declineCode}). Pay karne ke liye niche link par click karein:`;
+    const text = params.customMessage
+      ? params.customMessage.replace(/\{\{PAYMENT_LINK\}\}/g, params.paymentLink)
+      : `Aapka ₹${params.amountInr} ka payment fail ho gaya tha (${s.declineCode}). Pay karne ke liye niche link par click karein:`;
+
     await this.sendMessage(s.chatId, text, params.paymentLink);
+
+    if (params.caseId) {
+      this.deps.auditService.append("intervention.executed", {
+        caseId: params.caseId,
+        channel: "telegram",
+        chatId: s.chatId,
+        amount: params.amountInr,
+        paymentLink: params.paymentLink,
+        message: text,
+      });
+    }
+
     return true;
   }
 
@@ -442,12 +510,37 @@ export class TelegramAgent {
   // Core message handling
   private async handleCustomerMessage(chatId: number, firstName: string | undefined, text: string): Promise<void> {
     const s = this.ensureSession(chatId, firstName);
+
+    if (text === "/reset" || text === "/start") {
+      s.history = [];
+      s.promisedDate = undefined;
+      s.discountPercent = 0;
+      s.transcript = [];
+      await this.sendMessage(chatId, "Bot history cleared successfully. Say hi to start fresh!");
+      await this.persistSession(s);
+      return;
+    }
+
     s.transcript.push({ dir: "in", text, at: new Date().toISOString() });
     s.updatedAt = new Date().toISOString();
 
     // Two-step opt-out confirmation (DPDP consent flow)
     if (s.pendingOptOut) {
       s.transcript.push({ dir: "in", text, at: new Date().toISOString() });
+      if (s.caseId && this.deps.orchestrator) {
+        const res = this.deps.orchestrator.handleOptOutConfirmation(s.caseId, text);
+        if (res.confirmed) {
+          s.pendingOptOut = false;
+          s.optedOut = true;
+        } else if (/\b(no|nahi|nahin|cancel|rakho)\b/i.test(text)) {
+          s.pendingOptOut = false;
+        }
+        await this.sendMessage(chatId, res.message);
+        this.deps.auditService.append("customer.reply", { caseId: s.caseId, channel: "telegram", message: text, chatId });
+        this.deps.auditService.append("intervention.executed", { caseId: s.caseId, channel: "telegram", message: res.message, chatId });
+        return;
+      }
+
       const t = text.toLowerCase();
       const yes = /\b(yes|haan|han|haa|confirm|kar do|kardo|band kar do|ok|okay|sure)\b/.test(t);
       const no = /\b(no|nahi|nahin|cancel|rakho|rakhna|mat)\b/.test(t);
@@ -474,10 +567,159 @@ export class TelegramAgent {
     }
 
     try {
-      if (this.deps.geminiApiKey) {
-        await this.geminiReply(s, text);
+      await this.syncSessionFromDatabase(s);
+      let targetCaseId: string | undefined = s.caseId;
+      if (this.deps.orchestrator) {
+        // Resolve target case by session caseId or by phone number
+        if (targetCaseId) {
+          const c = this.deps.orchestrator.getCase(targetCaseId);
+          if (c && ["RECOVERED", "CLOSED_LOST", "SKIPPED_COMPLIANCE"].includes(c.state)) {
+            targetCaseId = undefined;
+          }
+        }
+        if (!targetCaseId) {
+          const normalizedTarget = s.phone ? s.phone.replace(/\D/g, "") : "";
+          if (normalizedTarget) {
+            const matches = this.deps.orchestrator.getCases({ limit: 200 }).filter(
+              (c: any) =>
+                c.customerPhone &&
+                c.customerPhone.replace(/\D/g, "") === normalizedTarget &&
+                !["RECOVERED", "CLOSED_LOST", "SKIPPED_COMPLIANCE"].includes(c.state)
+            );
+            if (matches.length === 1) {
+              targetCaseId = matches[0].id;
+              s.caseId = targetCaseId;
+            }
+          }
+        }
+      }
+
+      // Deterministic reconcile first: "already paid / de diya"
+      const isPaidClaim = /\b(already paid|de diya|bhar diya|paid|ho gaya|paise de diye)\b/i.test(text);
+      if (isPaidClaim && targetCaseId && this.deps.orchestrator) {
+        this.deps.auditService.append("customer.reply", {
+          caseId: targetCaseId,
+          channel: "telegram",
+          chatId: s.chatId,
+          message: text,
+        });
+
+        const cData = this.deps.orchestrator.getCase(targetCaseId);
+        const isActuallyPaid = cData?.state === "RECOVERED" || s.recovered || s.paymentLink?.status === "paid";
+        if (isActuallyPaid) {
+          this.deps.orchestrator.recordRecovery(targetCaseId);
+          s.recovered = true;
+          const msg = "🎉 Aapka payment hamare records me successfully verified ho gaya hai. Bahut bahut dhanyavaad! (Case Closed)";
+          await this.sendMessage(s.chatId, msg);
+          this.deps.auditService.append("intervention.executed", {
+            caseId: targetCaseId,
+            channel: "telegram",
+            chatId: s.chatId,
+            message: msg,
+          });
+          return;
+        } else {
+          const msg = "Humne system me check kiya par payment abhi reflect nahi ho paya hai. Agar aap payment kar chuke hain, toh kripya thoda wait karein ya reference number yahan share karein 🙏";
+          await this.sendMessage(s.chatId, msg);
+          this.deps.auditService.append("intervention.executed", {
+            caseId: targetCaseId,
+            channel: "telegram",
+            chatId: s.chatId,
+            message: msg,
+          });
+          return;
+        }
+      }
+
+      if (targetCaseId && this.deps.policyService && this.deps.orchestrator) {
+        const caseData = this.deps.orchestrator.getCase(targetCaseId);
+        if (caseData) {
+          this.deps.auditService.append("customer.reply", {
+            caseId: targetCaseId,
+            channel: "telegram",
+            chatId: s.chatId,
+            message: text,
+          });
+
+          const allowedActions = {
+            channels: ["telegram", "email"] as any,
+            delayWindows: [0, 4, 24],
+            maxAttempts: 3,
+            currentAttempt: caseData.attemptCount,
+            escalationThresholds: { softReminderAfterAttempts: 1, urgentReminderAfterAttempts: 2, humanEscalationAfterAttempts: 3 },
+            maxDiscountPercent: 10,
+            allowSubscriptionUpdate: false,
+            reasoning: "reply inbound telegram"
+          };
+
+          const decision = await this.deps.policyService.conversationalTurn(
+            targetCaseId,
+            caseData.state,
+            text,
+            "telegram",
+            allowedActions
+          );
+
+          let replyText = decision.message || decision.narration;
+
+          if (decision.metadata?.reason === "opt_out") {
+            s.pendingOptOut = true;
+            caseData.pendingOptOutConfirm = true;
+            replyText = "Kya aap waqai SAARE recovery reminders band karna chahte hain? Confirm karne ke liye 'YES' reply karein, ya continue rakhne ke liye 'NO' likhein 🙏";
+          } else if (decision.metadata?.reason === "hostile") {
+            this.deps.orchestrator.transitionState(targetCaseId, "CLOSED_LOST", "Hostile customer reply");
+            this.deps.orchestrator.cancelCaseJobs(targetCaseId);
+          } else if (decision.state === "PAUSED_PROMISE" && decision.metadata?.date) {
+            const recorded = this.deps.orchestrator.recordPromise(targetCaseId, decision.metadata.date, caseData.amount);
+            if (recorded) {
+              s.promisedDate = decision.metadata.date;
+              this.deps.auditService.append("promise.recorded", { channel: "telegram", chatId: s.chatId, promisedDate: s.promisedDate, caseId: targetCaseId });
+            } else {
+              replyText = "Aapka promise note nahi kiya ja saka (date invalid hai ya 3 promises ki limit poori ho gayi hai). Please abhi payment karein.";
+            }
+          } else if (decision.metadata?.objection === "expensive") {
+            s.discountPercent = decision.discountIncentive || 0;
+            // No link yet — wait for user confirmation
+          } else if (decision.metadata?.intent === "generate_link" || decision.state === "INTERVENING") {
+            if (!s.paymentLink) {
+              await this.executeTool("create_payment_link", {}, s);
+            }
+            if (s.paymentLink) {
+              replyText = replyText.replace(/\{\{PAYMENT_LINK\}\}/g, s.paymentLink.shortUrl);
+              if (!replyText.includes(s.paymentLink.shortUrl) && decision.metadata?.intent === "generate_link") {
+                replyText += `\n\n💳 Link: ${s.paymentLink.shortUrl}`;
+              }
+            }
+          }
+
+          if (decision.state && decision.state !== "CLOSED_LOST") {
+            this.deps.orchestrator.transitionState(targetCaseId, decision.state, decision.narration);
+          }
+
+          await this.sendMessage(s.chatId, replyText, decision.state === "INTERVENING" ? s.paymentLink?.shortUrl : undefined);
+
+          this.deps.auditService.append("intervention.executed", {
+            caseId: targetCaseId,
+            channel: "telegram",
+            chatId: s.chatId,
+            message: replyText,
+          });
+
+          if (s.voiceReplies && replyText && !s.recovered) {
+            await this.maybeSendVoiceNote(s.chatId, replyText);
+          }
+        } else {
+          await this.fallbackReply(s, text);
+        }
       } else {
-        await this.fallbackReply(s, text);
+        if (!this.deps.geminiApiKey) {
+          await this.fallbackReply(s, text);
+        } else {
+          const success = await this.geminiReply(s, text);
+          if (!success) {
+            await this.fallbackReply(s, text);
+          }
+        }
       }
     } catch (err: any) {
       console.warn("[Telegram] reply failed:", err?.message);
@@ -487,11 +729,30 @@ export class TelegramAgent {
     }
   }
 
-  /** Durable snapshot → Postgres (restart-survival). */
+  /** Durable snapshot → Postgres (restart-survival). Serializes the FULL
+   *  session — the merchant-view snapshot omits abandonedCart/voiceReplies/
+   *  pendingOptOut, which would silently drop them on every save. */
   private async persistSession(s: TelegramSession): Promise<void> {
-    const snap = (this.getSessionsForMerchant().find((x) => x.chatId === s.chatId)) as Record<string, unknown> | undefined;
-    if (!snap) return;
-    await dbSaveTelegramSession(s.chatId, { ...snap, history: s.history });
+    await dbSaveTelegramSession(s.chatId, {
+      customerName: s.customerName,
+      phone: s.phone,
+      caseId: s.caseId,
+      amountDueInr: s.amountInr,
+      declineCode: s.declineCode,
+      discountPercent: s.discountPercent,
+      promisedDate: s.promisedDate,
+      optedOut: s.optedOut,
+      pendingOptOut: s.pendingOptOut,
+      recovered: s.recovered,
+      voiceReplies: s.voiceReplies,
+      abandonedCart: s.abandonedCart,
+      paymentLink: s.paymentLink,
+      history: s.history,
+      transcript: s.transcript.slice(-100),
+      actions: s.actions.slice(-50),
+      createdAt: s.createdAt,
+      updatedAt: new Date().toISOString(),
+    });
   }
 
   // Guardrailed tools (the ONLY actions Gemini can take)
@@ -500,11 +761,11 @@ export class TelegramAgent {
     const result = await this.executeToolInner(name, args, s);
     const detail =
       name === "create_payment_link" ? `Payment link created (₹${(result as any).amount_inr ?? this.dueAmount(s)})`
-      : name === "record_promise" ? `Promise recorded for ${(result as any).promised_date || args?.date}`
-      : name === "set_discount" ? `Discount ${args?.percent}% applied → ₹${(result as any).new_amount_inr}`
-      : name === "opt_out_customer" ? "DPDP opt-out — all contact stopped"
-      : name === "get_customer_dues" ? "Checked customer dues"
-      : name;
+        : name === "record_promise" ? `Promise recorded for ${(result as any).promised_date || args?.date}`
+          : name === "set_discount" ? `Discount ${args?.percent}% applied → ₹${(result as any).new_amount_inr}`
+            : name === "opt_out_customer" ? "DPDP opt-out — all contact stopped"
+              : name === "get_customer_dues" ? "Checked customer dues"
+                : name;
     s.actions.push({ tool: name, detail: (result as any).error ? `${name} rejected: ${(result as any).error}` : detail, at: new Date().toISOString() });
     if ((result as any).error) {
       // Guardrail veto is merchant-visible
@@ -515,32 +776,34 @@ export class TelegramAgent {
 
   private async executeToolInner(name: string, args: any, s: TelegramSession): Promise<Record<string, unknown>> {
     switch (name) {
-      case "get_customer_dues":
+      case "get_customer_dues": {
+        await this.syncSessionFromDatabase(s);
         return {
           customer_name: s.customerName,
           amount_due_inr: this.dueAmount(s),
           original_amount_inr: s.amountInr,
-          decline_reason: s.declineCode,
+          decline_reason: s.declineCode || "INSUFFICIENT_FUNDS",
           discount_applied_percent: s.discountPercent,
           max_discount_allowed_percent: MAX_DISCOUNT_PERCENT,
+          payment_link: s.paymentLink?.shortUrl || null,
           promised_date: s.promisedDate || null,
           status: s.recovered ? "paid" : "pending",
         };
+      }
 
       case "create_payment_link": {
-        if (s.paymentLink && !s.recovered) {
-          return { short_url: s.paymentLink.shortUrl, simulated: s.paymentLink.simulated, note: "Existing link re-sent" };
-        }
-        const link = await createRecoveryPaymentLink(this.deps.razorpayClient, {
+        const caseLink = s.caseId ? this.deps.orchestrator?.getCase(s.caseId)?.paymentLink : undefined;
+        const { link, reused } = await getOrCreateRecoveryPaymentLink(this.deps.razorpayClient, caseLink || s.paymentLink, {
           amountInr: this.dueAmount(s),
           customerName: s.customerName,
           customerEmail: `${s.customerName.toLowerCase().replace(/\s+/g, ".")}@telegram.demo`,
           customerContact: `+91${String(s.chatId).slice(-10)}`,
           description: `RazorVasooli Telegram recovery — ${s.customerName}`,
-          notes: { channel: "telegram" },
+          notes: { channel: "telegram", ...(s.caseId ? { case_id: s.caseId } : {}) },
         });
-        s.paymentLink = { linkId: link.linkId, shortUrl: link.shortUrl, amountInr: this.dueAmount(s), simulated: link.simulated, status: "pending" };
-        return { short_url: link.shortUrl, simulated: link.simulated, amount_inr: this.dueAmount(s) };
+        s.paymentLink = { ...link, amountInr: this.dueAmount(s) };
+        if (s.caseId) this.deps.orchestrator?.recordPaymentLink(s.caseId, link);
+        return { short_url: link.shortUrl, simulated: link.simulated, amount_inr: this.dueAmount(s), reused };
       }
 
       case "record_promise": {
@@ -650,72 +913,161 @@ export class TelegramAgent {
     },
   ];
 
-  private async geminiReply(s: TelegramSession, userText: string): Promise<void> {
-    const apiKey = this.deps.geminiApiKey!;
-    s.history.push({ role: "user", parts: [{ text: userText }] });
+  private sanitizeGeminiHistory(history: ChatTurn[]): ChatTurn[] {
+    const clean: ChatTurn[] = [];
+    let i = 0;
+    while (i < history.length) {
+      const turn = history[i];
+      if (!turn || !turn.parts || turn.parts.length === 0) {
+        i++;
+        continue;
+      }
+      const hasFunctionCall = turn.parts.some((p: any) => !!p.functionCall);
+      const hasFunctionResponse = turn.parts.some((p: any) => !!p.functionResponse);
 
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
-    let payLinkSent = false;
-
-    for (let loop = 0; loop < MAX_TOOL_LOOPS; loop++) {
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-          contents: s.history.slice(-20),
-          tools: [{ functionDeclarations: TelegramAgent.TOOL_DECLS }],
-        }),
-      });
-      if (!res.ok) throw new Error(`Gemini ${res.status}: ${(await res.text()).slice(0, 200)}`);
-      const data: any = await res.json();
-      const parts: any[] = data.candidates?.[0]?.content?.parts || [];
-
-      const calls = parts.filter((p) => p.functionCall).map((p) => p.functionCall);
-      const textOut = parts.filter((p) => p.text).map((p) => p.text).join("\n").trim();
-
-      if (calls.length === 0) {
-        s.history.push({ role: "model", parts: [{ text: textOut || "…" }] });
-        if (textOut || (s.paymentLink && !payLinkSent)) {
-          await this.sendMessage(s.chatId, textOut || "Yeh lijiye payment link ji 👇", !payLinkSent ? s.paymentLink?.shortUrl : undefined);
-          // Phase V1: voice-replies ON ho to final answer ka audio bhi bhejo
-          if (s.voiceReplies && textOut && !s.recovered) {
-            await this.maybeSendVoiceNote(s.chatId, textOut);
+      if (hasFunctionCall) {
+        const nextTurn = history[i + 1];
+        const nextHasResponse = nextTurn?.parts?.some((p: any) => !!p.functionResponse);
+        if (nextTurn && nextHasResponse) {
+          clean.push(turn);
+          clean.push(nextTurn);
+          i += 2;
+        } else {
+          // Keep only text parts of orphaned function calls
+          const textParts = turn.parts.filter((p: any) => p.text);
+          if (textParts.length > 0) {
+            clean.push({ role: turn.role, parts: textParts });
           }
+          i++;
         }
-        return;
+      } else if (hasFunctionResponse) {
+        // Orphaned function response, discard
+        i++;
+      } else {
+        clean.push(turn);
+        i++;
       }
-
-      // Execute tools, feed results back to Gemini
-      s.history.push({ role: "model", parts });
-      const responseParts: Record<string, unknown>[] = [];
-      for (const call of calls) {
-        const result = await this.executeTool(call.name, call.args || {}, s);
-        responseParts.push({ functionResponse: { name: call.name, response: result } });
-      }
-      s.history.push({ role: "user", parts: responseParts });
     }
+
+    const merged: ChatTurn[] = [];
+    for (const turn of clean) {
+      if (merged.length > 0) {
+        const last = merged[merged.length - 1];
+        if (last.role === turn.role) {
+          last.parts.push(...turn.parts);
+          continue;
+        }
+      }
+      merged.push({ role: turn.role, parts: [...turn.parts] });
+    }
+
+    let sliced = merged.slice(-16);
+
+    // Ensure we start with a user turn that does NOT contain a functionResponse
+    while (
+      sliced.length > 0 &&
+      (sliced[0].role !== "user" || sliced[0].parts.some((p: any) => !!p.functionResponse))
+    ) {
+      sliced.shift();
+    }
+
+    return sliced;
   }
 
-  // Deterministic fallback (no GEMINI_API_KEY)
+  private async geminiReply(s: TelegramSession, userText: string): Promise<boolean> {
+    const apiKey = this.deps.geminiApiKey!;
+    s.history = this.sanitizeGeminiHistory(s.history);
+    const baseHistory: ChatTurn[] = [...s.history, { role: "user", parts: [{ text: userText }] }];
+
+    const modelCandidates = Array.from(
+      new Set([GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-3.5-flash", "gemini-3.7-flash"].filter(Boolean))
+    );
+    let payLinkSent = false;
+
+    for (const model of modelCandidates) {
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      const workingHistory: ChatTurn[] = JSON.parse(JSON.stringify(baseHistory));
+
+      try {
+        for (let loop = 0; loop < MAX_TOOL_LOOPS; loop++) {
+          const contentsToSend = this.sanitizeGeminiHistory(workingHistory);
+          const res = await fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              systemInstruction: { parts: [{ text: SYSTEM_PROMPT + `\n\nCURRENT DATE: ${new Date().toISOString().slice(0, 10)}` }] },
+              contents: contentsToSend,
+              tools: [{ functionDeclarations: TelegramAgent.TOOL_DECLS }],
+            }),
+          });
+          if (res.status === 429) {
+            throw new Error("429 Rate Limit");
+          }
+          if (!res.ok) {
+            const errText = await res.text();
+            if (res.status === 400) {
+              console.error(`[Telegram] Gemini 400 Error. contentsToSend dump:`, JSON.stringify(contentsToSend, null, 2));
+            }
+            throw new Error(`Gemini ${res.status}: ${errText.slice(0, 200)}`);
+          }
+          const data: any = await res.json();
+          const parts: any[] = data.candidates?.[0]?.content?.parts || [];
+
+          const calls = parts.filter((p: any) => p.functionCall).map((p: any) => p.functionCall);
+          const textOut = parts.filter((p: any) => p.text).map((p: any) => p.text).join("\n").trim();
+
+          if (calls.length === 0) {
+            workingHistory.push({ role: "model", parts: [{ text: textOut || "…" }] });
+            s.history = this.sanitizeGeminiHistory(workingHistory);
+            if (textOut || (s.paymentLink && !payLinkSent)) {
+              await this.sendMessage(s.chatId, textOut || "Yeh lijiye payment link ji 👇", !payLinkSent ? s.paymentLink?.shortUrl : undefined);
+              if (s.voiceReplies && textOut && !s.recovered) {
+                await this.maybeSendVoiceNote(s.chatId, textOut);
+              }
+            }
+            return true;
+          }
+
+          // Execute tools, feed results back to Gemini
+          workingHistory.push({ role: "model", parts });
+          const responseParts: Record<string, unknown>[] = [];
+          for (const call of calls) {
+            const result = await this.executeTool(call.name, call.args || {}, s);
+            responseParts.push({ functionResponse: { name: call.name, response: result } });
+          }
+          workingHistory.push({ role: "user", parts: responseParts });
+        }
+        return true;
+      } catch (err: any) {
+        if (err.message === "429 Rate Limit") {
+          console.warn(`[Telegram] Model ${model} hit 429; cascading to next candidate...`);
+        } else {
+          console.warn(`[Telegram] Gemini error with ${model}:`, err?.message);
+        }
+      }
+    }
+    return false;
+  }
+
+  // Deterministic fallback (no GEMINI_API_KEY or when all models fail)
   private async fallbackReply(s: TelegramSession, text: string): Promise<void> {
     const intent = parseHinglishReply(text);
+    let replyText = "";
+    let payLink: string | undefined;
 
     switch (intent.intent) {
       case "optout": {
-        // Two-step consent: ask before stopping (DPDP consent flow)
         s.pendingOptOut = true;
-        await this.sendMessage(
-          s.chatId,
-          "Ek confirmation chahiye ji 🙏 Kya aap waqai SAARE payment reminders band karna chahte hain?\n\n'YES' likhein confirm karne ke liye, ya 'NO' likhein agar reminders continue rakhne hain."
-        );
-        return;
+        replyText = "Ek confirmation chahiye ji 🙏 Kya aap waqai SAARE payment reminders band karna chahte hain?\n\n'YES' likhein confirm karne ke liye, ya 'NO' likhein agar reminders continue rakhne hain.";
+        await this.sendMessage(s.chatId, replyText);
+        break;
       }
       case "promise": {
         const date = intent.promisedDate || new Date(Date.now() + 5 * 864e5).toISOString().slice(0, 10);
         await this.executeTool("record_promise", { date }, s);
-        await this.sendMessage(s.chatId, `Done ji! 📌 Maine aapka promise ${date} ke liye note kar liya. Us din reminder bhejungi. Tab tak service active rahegi 😊`);
-        return;
+        replyText = `Done ji! 📌 Maine aapka promise ${date} ke liye note kar liya. Us din reminder bhejungi. Tab tak service active rahegi 😊`;
+        await this.sendMessage(s.chatId, replyText);
+        break;
       }
       case "discount_request": {
         if (!s.paymentLink) {
@@ -723,12 +1075,10 @@ export class TelegramAgent {
           await this.executeTool("set_discount", { percent: capped }, s);
           await this.executeTool("create_payment_link", {}, s);
         }
-        await this.sendMessage(
-          s.chatId,
-          `Ji bilkul! 🎁 Humne ${Math.min(MAX_DISCOUNT_PERCENT, 10)}% loyalty discount apply kar diya hai — naya amount sirf ₹${this.dueAmount(s).toLocaleString("en-IN")} hai.`,
-          s.paymentLink?.shortUrl
-        );
-        return;
+        replyText = `Ji bilkul! 🎁 Humne ${Math.min(MAX_DISCOUNT_PERCENT, 10)}% loyalty discount apply kar diya hai — naya amount sirf ₹${this.dueAmount(s).toLocaleString("en-IN")} hai.`;
+        payLink = s.paymentLink?.shortUrl;
+        await this.sendMessage(s.chatId, replyText, payLink);
+        break;
       }
       case "paid": {
         if (s.paymentLink?.simulated) {
@@ -736,29 +1086,23 @@ export class TelegramAgent {
           return;
         }
         const paid = s.paymentLink ? await this.refreshRealLinkStatus(s) : false;
-        await this.sendMessage(
-          s.chatId,
-          paid ? "🎉 Confirm! Payment receive ho gaya hai — dhanyavaad ji!" : "Ek second… abhi payment dikha nahi raha. Agar aapne pay kiya hai to 5-10 minute me reflect ho jayega. 🙏"
-        );
-        return;
+        replyText = paid ? "🎉 Confirm! Payment receive ho gaya hai — dhanyavaad ji!" : "Ek second… abhi payment dikha nahi raha. Agar aapne pay kiya hai to 5-10 minute me reflect ho jayega. 🙏";
+        await this.sendMessage(s.chatId, replyText);
+        break;
       }
       default: {
-        if (!s.paymentLink) {
-          const link = await createRecoveryPaymentLink(this.deps.razorpayClient, {
-            amountInr: this.dueAmount(s),
-            customerName: s.customerName,
-            description: "RazorVasooli Telegram recovery",
-          });
-          s.paymentLink = { linkId: link.linkId, shortUrl: link.shortUrl, amountInr: this.dueAmount(s), simulated: link.simulated, status: "pending" };
-        }
-        await this.sendMessage(
-          s.chatId,
-          `Koi baat nahi ji, samajh sakti hoon 🙏 Aapka ₹${this.dueAmount(s).toLocaleString("en-IN")} pending hai ` +
-            `(${s.declineCode === "INSUFFICIENT_FUNDS" ? "balance issue" : "payment failure"} ki wajah se). ` +
-            `Jab comfortable ho, niche diye secure link se ek minute me pay kar sakte hain 👇 Ya bataiye kab tak kar payenge?`,
-          s.paymentLink.shortUrl
-        );
+        await this.executeTool("create_payment_link", {}, s);
+        replyText = `Koi baat nahi ji, samajh sakti hoon 🙏 Aapka ₹${this.dueAmount(s).toLocaleString("en-IN")} pending hai ` +
+          `(${s.declineCode === "INSUFFICIENT_FUNDS" ? "balance issue" : "payment failure"} ki wajah se). ` +
+          `Jab comfortable ho, niche diye secure link se ek minute me pay kar sakte hain 👇 Ya bataiye kab tak kar payenge?`;
+        payLink = s.paymentLink?.shortUrl;
+        await this.sendMessage(s.chatId, replyText, payLink);
+        break;
       }
+    }
+
+    if (s.voiceReplies && replyText && !s.recovered) {
+      await this.maybeSendVoiceNote(s.chatId, replyText);
     }
   }
 
@@ -879,26 +1223,26 @@ export function buildDemoSessions(): Array<ReturnType<TelegramAgent["getSessions
     {
       chatId: 552001,
       customerName: "Priya Sharma",
-      amountDueInr: 2374,
+      amountDueInr: 476,
       discountPercent: 5,
       declineCode: "INSUFFICIENT_FUNDS",
       promisedDate: new Date(now + 5 * 864e5).toISOString().slice(0, 10),
       optedOut: false,
       recovered: false,
-      paymentLink: { shortUrl: "https://rzp.io/i/demo-priya", simulated: true, status: "pending" },
+      paymentLink: { shortUrl: "https://rzp.io/rzp/Gc0lQdyM", simulated: false, status: "pending" },
       transcript: [
-        { dir: "out", text: "Namaste Priya ji! 🙏 Main RazorVasooli AI hoon. Aapka ₹2,499 ka payment fail hua tha (balance issue). Kya main help kar sakti hoon?", at: iso(42) },
+        { dir: "out", text: "Namaste Priya ji! 🙏 Main RazorVasooli AI hoon. Aapka ₹501 ka payment fail hua tha (balance issue). Kya main help kar sakti hoon?", at: iso(42) },
         { dir: "in", text: "arre yaar paise nahi hai abhi 😅", at: iso(40) },
         { dir: "out", text: "Koi baat nahi ji, samajh sakti hoon! Salary kab aa rahi hai? Tab tak main reminder set kar dungi 😊", at: iso(39) },
         { dir: "in", text: "5 tarikh ko aayegi salary, tab pakka de dungi", at: iso(38) },
-        { dir: "out", text: "Done ji! 📌 Promise note ho gaya — 5 tarikh. Aur dekhiye, aapke liye 5% loyalty discount bhi lagaya hai, naya amount sirf ₹2,374. Link niche hai 👇", payLink: "https://rzp.io/i/demo-priya", at: iso(37) },
+        { dir: "out", text: "Done ji! 📌 Promise note ho gaya — 5 tarikh. Aur dekhiye, aapke liye 5% loyalty discount bhi lagaya hai, naya amount sirf ₹476. Link niche hai 👇", payLink: "https://rzp.io/rzp/Gc0lQdyM", at: iso(37) },
         { dir: "in", text: "ok thank you! 🙏", at: iso(36) },
       ],
       actions: [
         { tool: "get_customer_dues", detail: "Checked customer dues", at: iso(41) },
         { tool: "record_promise", detail: "Promise recorded (5 tarikh)", at: iso(38) },
-        { tool: "set_discount", detail: "Discount 5% applied → ₹2,374", at: iso(37) },
-        { tool: "create_payment_link", detail: "Payment link created (₹2,374)", at: iso(37) },
+        { tool: "set_discount", detail: "Discount 5% applied → ₹476", at: iso(37) },
+        { tool: "create_payment_link", detail: "Payment link created (₹476)", at: iso(37) },
       ],
       createdAt: iso(43),
       updatedAt: iso(36),
@@ -968,7 +1312,10 @@ const SYSTEM_PROMPT =
   "You are RazorVasooli — a warm, polite Indian payment-recovery agent chatting on Telegram in natural Hinglish " +
   "(Roman-script Hindi mixed with English). Keep messages short like WhatsApp chats. Be empathetic but goal-oriented: " +
   "your goal is either a payment (create_payment_link) or a firm promise date (record_promise). " +
-  "Always call get_customer_dues before quoting any amount. Never offer more discount than allowed. " +
+  "DATABASE DUES RULE: Always call get_customer_dues tool before discussing or quoting any amount, discount, or payment link to retrieve the customer's actual live database record. " +
+  "Quote the EXACT amount_due_inr and payment_link returned by get_customer_dues. Never invent or hallucinate arbitrary amounts. " +
+  "If the customer asks for a discount or says the price is too high, call set_discount (up to 10% max) and mention the discounted amount. " +
+  "If the customer states when they will pay (e.g. tomorrow, 5th, next week), call record_promise and CRITICALLY ENSURE the date is exactly in YYYY-MM-DD format (year-month-date). " +
   "CART RULE: if get_cart_details returns items, the customer abandoned a cart — open by asking " +
   "why they left, handle the objection (price too high → set_discount within cap; payment issue → fresh " +
   "create_payment_link; just browsing → mention any upcoming sale), and recover the CART value. " +
@@ -1022,5 +1369,3 @@ export async function startTelegramBot(deps: TelegramAgentDeps): Promise<Telegra
   console.log("📨 [Telegram] Bot live (long-polling) — customers can now chat with the AI agent");
   return agent;
 }
-
-
