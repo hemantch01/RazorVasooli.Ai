@@ -5,8 +5,7 @@
 import { describe, it, expect } from "vitest";
 import {
   computeAllowedActions,
-  vetoCheck,
-  shouldUseAgent,
+  validateAgentDecision,
   parseAgentResponse,
   type AgentChoice,
 } from "../../server/services/policy.js";
@@ -43,7 +42,7 @@ describe("computeAllowedActions", () => {
   });
 });
 
-describe("vetoCheck — the LLM guardrail", () => {
+describe("validateAgentDecision — the LLM guardrail", () => {
   it("accepts a choice fully within the allowed action set", async () => {
     const input = await makeInput();
     const allowed = computeAllowedActions(input);
@@ -53,8 +52,9 @@ describe("vetoCheck — the LLM guardrail", () => {
       escalationLevel: "none",
       discountIncentive: 0,
       narration: "within bounds",
+      state: "INTERVENING",
     };
-    expect(vetoCheck(choice, allowed).isValid).toBe(true);
+    expect(validateAgentDecision("DETECTED", choice, allowed).vetoReason).toBeUndefined();
   });
 
   it("vetoes a disallowed channel", async () => {
@@ -63,65 +63,63 @@ describe("vetoCheck — the LLM guardrail", () => {
     const disallowed = (["email", "sms", "whatsapp", "payment_link", "subscription_update_link", "voice_call"] as const)
       .find((c) => !allowed.channels.includes(c));
     if (!disallowed) return; // all channels allowed for this case — skip
-    const result = vetoCheck(
-      { channel: disallowed, delayHours: allowed.delayWindows[0], escalationLevel: "none", discountIncentive: 0, narration: "" },
+    const result = validateAgentDecision(
+      "DETECTED",
+      { channel: disallowed, delayHours: allowed.delayWindows[0], escalationLevel: "none", discountIncentive: 0, narration: "", state: "INTERVENING" },
       allowed
     );
-    expect(result.isValid).toBe(false);
-    expect(result.violations[0]).toMatch(/not in allowed set/i);
+    expect(result.vetoReason).toBeDefined();
+    expect(result.vetoReason).toMatch(/not allowed/i);
+    expect(result.decision.channel).toBe(allowed.channels[0]); // clamped
   });
 
   it("vetoes an out-of-window delay", async () => {
     const input = await makeInput();
     const allowed = computeAllowedActions(input);
-    const result = vetoCheck(
-      { channel: allowed.channels[0], delayHours: 9999, escalationLevel: "none", discountIncentive: 0, narration: "" },
+    const result = validateAgentDecision(
+      "DETECTED",
+      { channel: allowed.channels[0], delayHours: 9999, escalationLevel: "none", discountIncentive: 0, narration: "", state: "INTERVENING" },
       allowed
     );
-    expect(result.isValid).toBe(false);
-    expect(result.violations.join(" ")).toMatch(/not in allowed windows/i);
+    expect(result.vetoReason).toBeDefined();
+    expect(result.vetoReason).toMatch(/not allowed/i);
+    expect(result.decision.delayHours).toBe(allowed.delayWindows[0]); // clamped
   });
 
   it("vetoes a discount exceeding the maximum", async () => {
     const input = await makeInput();
     const allowed = computeAllowedActions(input);
-    const result = vetoCheck(
-      { channel: allowed.channels[0], delayHours: allowed.delayWindows[0], escalationLevel: "none", discountIncentive: allowed.maxDiscountPercent + 50, narration: "" },
+    const result = validateAgentDecision(
+      "DETECTED",
+      { channel: allowed.channels[0], delayHours: allowed.delayWindows[0], escalationLevel: "none", discountIncentive: allowed.maxDiscountPercent + 50, narration: "", state: "INTERVENING" },
       allowed
     );
-    expect(result.isValid).toBe(false);
-    expect(result.violations.join(" ")).toMatch(/exceeds max/i);
+    expect(result.vetoReason).toBeDefined();
+    expect(result.vetoReason).toMatch(/exceeds max/i);
+    expect(result.decision.discountIncentive).toBe(allowed.maxDiscountPercent); // clamped
   });
 
   it("vetoes negative discounts", async () => {
     const input = await makeInput();
     const allowed = computeAllowedActions(input);
-    const result = vetoCheck(
-      { channel: allowed.channels[0], delayHours: allowed.delayWindows[0], escalationLevel: "none", discountIncentive: -10, narration: "" },
+    const result = validateAgentDecision(
+      "DETECTED",
+      { channel: allowed.channels[0], delayHours: allowed.delayWindows[0], escalationLevel: "none", discountIncentive: -10, narration: "", state: "INTERVENING" },
       allowed
     );
-    expect(result.violations.join(" ")).toMatch(/negative/i);
+    expect(result.decision.discountIncentive).toBe(0); // clamped
   });
-});
 
-describe("shouldUseAgent", () => {
-  it("routes ambiguous-score cases to the agent", async () => {
+  it("vetoes RECOVERED because only a verified payment webhook may set it", async () => {
     const input = await makeInput();
-    // score forced into the ambiguous band
-    const patched = { ...input, recoverability: { ...input.recoverability, score: 0.5 } };
-    expect(shouldUseAgent(patched as never)).toBe(true);
-  });
-
-  it("routes high-value cases (>₹25K) to the agent regardless of score", async () => {
-    const input = await makeInput({ amount: 90000 });
-    const patched = { ...input, recoverability: { ...input.recoverability, score: 0.1 } };
-    expect(shouldUseAgent(patched as never)).toBe(true);
-  });
-
-  it("keeps clear low-value cases on deterministic rules", async () => {
-    const input = await makeInput({ amount: 1000 });
-    const patched = { ...input, recoverability: { ...input.recoverability, score: 0.05 } };
-    expect(shouldUseAgent(patched as never)).toBe(false);
+    const allowed = computeAllowedActions(input);
+    const result = validateAgentDecision(
+      "INTERVENING",
+      { channel: allowed.channels[0], delayHours: allowed.delayWindows[0], escalationLevel: "none", discountIncentive: 0, narration: "customer claims they paid", state: "RECOVERED" },
+      allowed
+    );
+    expect(result.vetoReason).toMatch(/webhook-only/i);
+    expect(result.decision.state).toBe("INTERVENING");
   });
 });
 

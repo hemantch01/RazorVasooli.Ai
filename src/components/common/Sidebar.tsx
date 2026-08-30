@@ -1,5 +1,6 @@
 import {
   LayoutDashboard,
+  Link2,
   FileWarning,
   Webhook,
   BookOpen,
@@ -20,6 +21,7 @@ interface SidebarProps {
 
 const NAV_ITEMS: { id: ViewId; label: string; icon: React.ElementType }[] = [
   { id: "overview", label: "Command Center", icon: LayoutDashboard },
+  { id: "links", label: "Payment Links", icon: Link2 },
   { id: "cases", label: "Case Directory", icon: FolderSearch },
   { id: "invoices", label: "Failed Invoices", icon: FileWarning },
   { id: "telegram", label: "Telegram Live", icon: Send },

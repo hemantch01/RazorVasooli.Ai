@@ -30,9 +30,10 @@ describe("AuditService", () => {
   it("produces identical hashes for identical content (deterministic canonical JSON)", () => {
     const a = new AuditService(10);
     const b = new AuditService(10);
+    const fixedTs = "2026-08-30T18:00:00.000Z";
     // Different key insertion order, same logical payload → same chain hash
-    const e1 = a.append("evt", { alpha: 1, beta: { z: 1, a: 2 } });
-    const e2 = b.append("evt", { beta: { a: 2, z: 1 }, alpha: 1 });
+    const e1 = a.append("evt", { alpha: 1, beta: { z: 1, a: 2 } }, fixedTs);
+    const e2 = b.append("evt", { beta: { a: 2, z: 1 }, alpha: 1 }, fixedTs);
     expect(e1.hash).toBe(e2.hash);
   });
 

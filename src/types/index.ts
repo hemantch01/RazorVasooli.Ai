@@ -100,6 +100,7 @@ export interface KPIMetric {
 
 export type ViewId =
   | "overview"
+  | "links"
   | "agent"
   | "invoices"
   | "webhooks"

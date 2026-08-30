@@ -44,6 +44,29 @@ describe("state machine transitions", () => {
     svc.transitionState("c1", "SKIPPED_COMPLIANCE", "dpdp stop");
     expect(svc.transitionState("c1", "INTERVENING", "resurrection")).toBeNull();
   });
+
+  it("runs a promise sweep as a contextual intervention after the promise date", async () => {
+    svc.transitionState("c1", "DIAGNOSED", "test");
+    svc.transitionState("c1", "POLICY_SELECTED", "test");
+    svc.transitionState("c1", "INTERVENING", "test");
+    const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const paused = svc.recordPromise("c1", tomorrow, 1000);
+    const job = svc.getJobs({ caseId: "c1" }).find((candidate) => candidate.type === "promise_sweep");
+
+    expect(paused?.state).toBe("PAUSED_PROMISE");
+    expect(job?.executeAt).toBe(`${tomorrow}T04:30:00.000Z`);
+
+    svc.setPromiseReminderProvider(async () => "Promise reminder {{PAYMENT_LINK}}");
+    let deliveredMessage = "";
+    svc.setInterventionHandler(async (_caseData, executedJob) => {
+      deliveredMessage = executedJob.customMessage || "";
+    });
+
+    await (svc as any).executeJob(job!.id);
+    expect(svc.getCase("c1")?.state).toBe("INTERVENING");
+    expect(deliveredMessage).toContain("{{PAYMENT_LINK}}");
+    svc.destroy();
+  });
 });
 
 describe("compliance hard stops", () => {

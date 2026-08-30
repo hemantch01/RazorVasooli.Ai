@@ -3,6 +3,7 @@ import { MessageSquare, Phone } from "lucide-react";
 import { Sidebar } from "./components/common/Sidebar";
 import { Navbar } from "./components/common/Navbar";
 import { OverviewView } from "./components/dashboard/OverviewView";
+import { PaymentLinksView } from "./components/links/PaymentLinksView";
 
 import { FailedInvoicesView } from "./components/invoices/FailedInvoicesView";
 
@@ -33,6 +34,8 @@ function App() {
     switch (activeView) {
       case "overview":
         return <OverviewView />;
+      case "links":
+        return <PaymentLinksView />;
       case "invoices":
         return <FailedInvoicesView />;
       case "webhooks":
