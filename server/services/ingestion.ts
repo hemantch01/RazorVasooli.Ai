@@ -91,6 +91,8 @@ export interface RiskEvent {
   payload: Record<string, any>;
   customerId?: string;
   customerEmail?: string;
+  customerPhone?: string;
+  customerName?: string;
   amount?: number;
   currency?: string;
   declineCode?: string;

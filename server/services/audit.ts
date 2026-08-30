@@ -65,8 +65,8 @@ export class AuditService {
   /**
    * Append an event to the hash chain (single-writer sink).
    */
-  append(eventType: string, payload: Record<string, unknown>): AuditEntry {
-    const timestamp = new Date().toISOString();
+  append(eventType: string, payload: Record<string, unknown>, timestampOverride?: string): AuditEntry {
+    const timestamp = timestampOverride || new Date().toISOString();
     // Seq continues from the head of the chain (robust after restore-from-DB)
     const seq = (this.ledger.at(-1)?.seq ?? 0) + 1;
 

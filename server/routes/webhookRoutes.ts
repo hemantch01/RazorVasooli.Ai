@@ -3,6 +3,7 @@ import express, { type Request, type Response } from "express";
 import { classifyRiskSeverity, type RiskEvent, type RiskEventType } from "../services/ingestion.js";
 import crypto from "node:crypto";
 import { metrics } from "../core/metrics.js";
+import { getOrCreateRecoveryPaymentLink } from "../services/channels.js";
 
 interface WebhookRecord {
   id: string;
@@ -82,44 +83,31 @@ app.post("/api/webhooks/razorpay", async (req: Request & { rawBody?: Buffer }, r
 
   if (eventType === "payment.failed" || eventType === "subscription.halted" || eventType === "invoice.expired") {
     const paymentEntity = payloadData.payment?.entity || payloadData;
-    const amount = paymentEntity.amount ? paymentEntity.amount / 100 : 24999;
+    const amount = paymentEntity.amount ? paymentEntity.amount / 100 : 501;
     const customerEmail = paymentEntity.email || "customer@example.com";
     const customerContact = paymentEntity.contact || "+919876543210";
-    const errorCode = paymentEntity.error_code || "INSUFFICIENT_FUNDS";
+    // Razorpay payment entities carry error_reason / error_description — prioritize specific error_reason over generic error_code
+    const errorCode = paymentEntity.error_reason || paymentEntity.error_code || paymentEntity.error_description || "INSUFFICIENT_FUNDS";
 
-    // Task 1.3: Generate dynamic recovery link
+    // Generate recovery link via hardened channel helper
     try {
-      if (razorpayClient) {
-        const linkResponse = await razorpayClient.paymentLink.create({
-          amount: Math.round(amount * 100), // in paise
-          currency: "INR",
-          accept_partial: false,
-          description: `RazorVasooli Recovery for Failed Invoice (${errorCode})`,
-          customer: {
-            name: "Subscriber",
-            email: customerEmail,
-            contact: customerContact,
-          },
-          notify: {
-            sms: true,
-            email: true,
-          },
-          reminder_enable: true,
-          notes: {
-            recovery_agent: "RazorVasooli.Ai",
-            decline_reason: errorCode,
-          },
-        });
-        generatedPaymentLink = linkResponse.short_url;
-      } else {
-        generatedPaymentLink = `https://rzp.io/i/vasooli-${Math.random().toString(36).substring(2, 8)}`;
-      }
-
-      aiAction = `Autonomous AI intercepted ${errorCode} → Applied 5% discount → Generated Razorpay UPI intent link: ${generatedPaymentLink}`;
+      const { link } = await getOrCreateRecoveryPaymentLink(razorpayClient, undefined, {
+        amountInr: amount,
+        customerName: "Subscriber",
+        customerEmail: customerEmail,
+        customerContact: customerContact,
+        description: `RazorVasooli Recovery for Failed Invoice (${errorCode})`,
+        notes: {
+          recovery_agent: "RazorVasooli.Ai",
+          decline_reason: errorCode,
+        },
+      });
+      generatedPaymentLink = link.shortUrl;
+      aiAction = `Autonomous AI intercepted ${errorCode} → Generated Razorpay UPI intent link: ${generatedPaymentLink}`;
     } catch (linkErr: any) {
       console.error("[Razorpay Link Error]:", linkErr?.message || linkErr);
-      generatedPaymentLink = `https://rzp.io/i/vasooli-sim-${Date.now().toString(36)}`;
-      aiAction = `Autonomous AI intercepted failure → Generated backup payment link: ${generatedPaymentLink}`;
+      generatedPaymentLink = "";
+      aiAction = `Autonomous AI intercepted failure: ${errorCode}`;
     }
 
     // Update or add to tracked failed invoices
@@ -187,9 +175,11 @@ app.post("/api/webhooks/razorpay", async (req: Request & { rawBody?: Buffer }, r
     payload: payloadData,
     customerId: paymentEntity.customer_id,
     customerEmail: linkEntity?.customer_details?.email || paymentEntity.email,
+    customerPhone: linkEntity?.customer_details?.contact || paymentEntity.contact,
+    customerName: linkEntity?.customer_details?.name || paymentEntity.customer_name,
     amount: (linkEntity?.amount ?? paymentEntity.amount) ? (linkEntity?.amount ?? paymentEntity.amount) / 100 : undefined,
     currency: paymentEntity.currency || "INR",
-    declineCode: paymentEntity.error_code,
+    declineCode: paymentEntity.error_reason || paymentEntity.error_code || paymentEntity.error_description,
     subscriptionId: paymentEntity.subscription_id,
     invoiceId: paymentEntity.invoice_id,
     receivedAt: new Date().toISOString(),

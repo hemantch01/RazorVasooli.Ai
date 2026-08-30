@@ -12,8 +12,8 @@
  */
 
 import { type PolicyDecision, type Channel, type EscalationLevel } from "./policy.js";
+import type { StoredPaymentLink } from "./channels.js";
 import { metrics } from "../core/metrics.js";
-import { recordOutcome } from "./outcomeMemory.js";
 import { embedAndStore, buildCaseNarrative } from "./embeddings.js";
 
 // 1. TASK 5.1: State Machine Core
@@ -34,7 +34,7 @@ export type CaseState =
 /** All valid state transitions */
 const VALID_TRANSITIONS: Record<CaseState, CaseState[]> = {
   DETECTED:           ["DIAGNOSED", "SKIPPED_COMPLIANCE"],
-  DIAGNOSED:          ["POLICY_SELECTED", "SKIPPED_COMPLIANCE", "CLOSED_LOST"],
+  DIAGNOSED:          ["POLICY_SELECTED", "RECOVERED", "SKIPPED_COMPLIANCE", "CLOSED_LOST"],
   POLICY_SELECTED:    ["INTERVENING", "RECOVERED", "PAUSED_PROMISE", "SKIPPED_COMPLIANCE", "ESCALATED", "CLOSED_LOST"],
   INTERVENING:        ["RECOVERED", "PAUSED_PROMISE", "ESCALATED", "CLOSED_LOST", "SKIPPED_COMPLIANCE", "POLICY_SELECTED"],
   PAUSED_PROMISE:     ["RECOVERED", "INTERVENING", "ESCALATED", "CLOSED_LOST"],
@@ -77,9 +77,15 @@ export interface RecoveryCase {
   scheduledJobs: ScheduledJob[];
   /** Customer promise */
   promise?: PaymentPromise;
+  /** Canonical recovery link. The server, never the LLM, owns this lifecycle. */
+  paymentLink?: StoredPaymentLink;
   /** Compliance flags */
   dpdpOptedOut: boolean;
   quietHoursDeferred: boolean;
+  /** Two-step opt-out pending confirmation */
+  pendingOptOutConfirm?: boolean;
+  /** Count of promises made (cap <= 3) */
+  promiseCount?: number;
   /** Audit trail */
   transitions: StateTransition[];
   /** Timestamps */
@@ -248,7 +254,8 @@ export interface ScheduledJob {
   channel?: Channel;
   escalationLevel?: EscalationLevel;
   discountPercent?: number;
-  /** Metadata */
+  /** Gemini generated message for outreach */
+  customMessage?: string;
   createdAt: string;
   completedAt?: string;
   failureReason?: string;
@@ -289,6 +296,9 @@ export class OrchestratorService {
   private jobTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private complianceConfig: ComplianceConfig;
   private maxCases: number;
+  private conversationProvider?: (caseId: string) => string;
+  /** Produces the safe, contextual message sent when a payment promise expires. */
+  private promiseReminderProvider?: (caseData: RecoveryCase) => Promise<string>;
 
   /** Callback when an intervention should be executed */
   private onExecuteIntervention?: (
@@ -320,6 +330,32 @@ export class OrchestratorService {
   ) {
     this.complianceConfig = complianceConfig;
     this.maxCases = maxCases;
+  }
+
+  setConversationProvider(fn: (caseId: string) => string): void {
+    this.conversationProvider = fn;
+  }
+
+  setPromiseReminderProvider(fn: (caseData: RecoveryCase) => Promise<string>): void {
+    this.promiseReminderProvider = fn;
+  }
+
+  recordPaymentLink(caseId: string, link: StoredPaymentLink): RecoveryCase | null {
+    const caseData = this.cases.get(caseId);
+    if (!caseData) return null;
+    caseData.paymentLink = link;
+    caseData.updatedAt = new Date().toISOString();
+    this.persist(caseData);
+    return caseData;
+  }
+
+  markPaymentLinkStatus(caseId: string, status: StoredPaymentLink["status"]): RecoveryCase | null {
+    const caseData = this.cases.get(caseId);
+    if (!caseData?.paymentLink) return caseData || null;
+    caseData.paymentLink.status = status;
+    caseData.updatedAt = new Date().toISOString();
+    this.persist(caseData);
+    return caseData;
   }
 
   /** Optional durability hook: invoked whenever a case is created/updated. */
@@ -485,48 +521,14 @@ export class OrchestratorService {
       this.stats.totalRecovered++;
       this.stats.totalRecoveredAmount += recoveredAmt;
       metrics.recoveredRupees("case_recovered", recoveredAmt);
-      // Phase L1: feed the learning loop — this outcome updates the channel
-      // success memory that future policy decisions rank against.
-      if (caseData.category && caseData.currentDecision) {
-        recordOutcome({
-          category: caseData.category,
-          channel: caseData.currentDecision.channel,
-          attempt: Math.max(1, caseData.attemptCount),
-          recovered: true,
-          amountInr: recoveredAmt,
-          discountPercent: caseData.currentDecision.discountIncentive || undefined,
-          source: "live",
-        });
-      }
       this.cancelCaseJobs(caseId);
     } else if (newState === "SKIPPED_COMPLIANCE") {
       this.stats.totalSkippedCompliance++;
       this.cancelCaseJobs(caseId);
     } else if (newState === "ESCALATED") {
       this.stats.totalEscalated++;
-      // Phase L1 fix: failures must count too — success-only recording caused
-      // selection bias (every channel looked unbeatable). ESCALATED after
-      // intervention attempts = the chosen channel did NOT recover the money.
-      if (caseData.category && caseData.currentDecision) {
-        recordOutcome({
-          category: caseData.category,
-          channel: caseData.currentDecision.channel,
-          attempt: Math.max(1, caseData.attemptCount),
-          recovered: false,
-          source: "live",
-        });
-      }
+      this.cancelCaseJobs(caseId);
     } else if (newState === "CLOSED_LOST") {
-      // Phase L1 fix: same failure accounting as ESCALATED.
-      if (caseData.category && caseData.currentDecision) {
-        recordOutcome({
-          category: caseData.category,
-          channel: caseData.currentDecision.channel,
-          attempt: Math.max(1, caseData.attemptCount),
-          recovered: false,
-          source: "live",
-        });
-      }
       this.cancelCaseJobs(caseId);
     }
 
@@ -545,36 +547,71 @@ export class OrchestratorService {
 
   /** Helper to auto-embed resolved cases (Phase L2) */
   private async autoEmbedCase(caseData: RecoveryCase): Promise<void> {
-    await embedAndStore(
-      caseData.id,
-      buildCaseNarrative(caseData, undefined),
-      {
-        category: caseData.category || "unknown",
-        channel: caseData.currentDecision?.channel || "unknown",
-        recovered: caseData.state === "RECOVERED",
-        amountInr: caseData.amount,
-        discount: caseData.currentDecision?.discountIncentive || 0,
-      }
-    );
+    try {
+      const convoStr = this.conversationProvider?.(caseData.id) ?? "";
+      await embedAndStore(
+        caseData.id,
+        buildCaseNarrative(caseData, convoStr),
+        {
+          category: caseData.category || "unknown",
+          channel: caseData.currentDecision?.channel || "unknown",
+          recovered: caseData.state === "RECOVERED",
+          amountInr: caseData.amount,
+          discount: caseData.currentDecision?.discountIncentive || 0,
+        }
+      );
+      console.log(`[Orchestrator] 🧠 Auto-embedded case ${caseData.id} into vector DB`);
+    } catch (err: any) {
+      console.error(`[Orchestrator] ❌ autoEmbedCase failed for ${caseData.id}:`, err?.message || err);
+    }
   }
 
   // Policy Application
 
-  /**
-   * Apply a policy decision to a case and schedule the intervention.
-   */
   applyDecision(caseId: string, decision: PolicyDecision): RecoveryCase | null {
     const caseData = this.cases.get(caseId);
     if (!caseData) return null;
 
-    // Transition to POLICY_SELECTED
-    if (caseData.state === "DIAGNOSED" || caseData.state === "INTERVENING") {
+    caseData.currentDecision = decision;
+
+    const targetState = decision.state || "INTERVENING";
+
+    if (targetState === "PAUSED_PROMISE") {
+      const pDateStr = decision.metadata?.date || new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+      const recorded = this.recordPromise(caseId, pDateStr, caseData.amount);
+      if (!recorded) {
+        this.transitionState(caseId, "INTERVENING", "Promise rejected (invalid date or cap <= 3 exceeded)");
+      }
+      return caseData;
+    }
+
+    if (targetState === "CLOSED_LOST") {
+      if (decision.metadata?.reason === "hostile") {
+        this.transitionState(caseId, "CLOSED_LOST", "Hostile customer — immediate close");
+        this.cancelCaseJobs(caseId);
+        return caseData;
+      }
+      if (decision.metadata?.reason === "opt_out") {
+        // Spec: two-step confirmation! Do NOT transition or register DPDP yet!
+        caseData.pendingOptOutConfirm = true;
+        console.log(`[Orchestrator] Case ${caseId}: Customer requested opt-out — awaiting two-step confirmation`);
+        return caseData;
+      }
+      this.transitionState(caseId, "CLOSED_LOST", decision.metadata?.reason || "Closed by agent");
+      return caseData;
+    }
+
+    if (targetState === "ESCALATED") {
+      this.transitionState(caseId, "ESCALATED", decision.metadata?.reason || "Escalated by agent");
+      return caseData;
+    }
+
+    // Default to INTERVENING
+    if (caseData.state === "DIAGNOSED" || caseData.state === "INTERVENING" || caseData.state === "POLICY_SELECTED") {
       this.transitionState(caseId, "POLICY_SELECTED",
         `Policy decision: ${decision.decisionSource} → ${decision.channel}/${decision.delayHours}h`
       );
     }
-
-    caseData.currentDecision = decision;
 
     // Run compliance check before scheduling
     const compliance = checkCompliance(caseData, this.complianceConfig);
@@ -628,6 +665,7 @@ export class OrchestratorService {
       channel: decision.channel,
       escalationLevel: decision.escalationLevel,
       discountPercent: decision.discountIncentive,
+      customMessage: decision.message,
     });
 
     caseData.scheduledJobs.push(job);
@@ -649,6 +687,7 @@ export class OrchestratorService {
     channel?: Channel;
     escalationLevel?: EscalationLevel;
     discountPercent?: number;
+    customMessage?: string;
   }): ScheduledJob {
     const now = new Date().toISOString();
     const jobId = `job_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
@@ -662,6 +701,7 @@ export class OrchestratorService {
       channel: params.channel,
       escalationLevel: params.escalationLevel,
       discountPercent: params.discountPercent,
+      customMessage: params.customMessage,
       createdAt: now,
       retryCount: 0,
     };
@@ -729,6 +769,7 @@ export class OrchestratorService {
           channel: job.channel,
           escalationLevel: job.escalationLevel,
           discountPercent: job.discountPercent,
+          customMessage: job.customMessage,
         });
         return;
       }
@@ -753,6 +794,25 @@ export class OrchestratorService {
     caseData.attemptCount++;
 
     try {
+      if (job.type === "promise_sweep") {
+        const promise = caseData.promise;
+        if (!promise) {
+          job.status = "cancelled";
+          job.failureReason = "Promise details not found";
+          this.persistJob(job);
+          return;
+        }
+
+        // A captured-payment webhook would already have moved the case to
+        // RECOVERED and cancelled this job. Reaching here means the promise
+        // was not verified, so resume recovery with a date-specific reminder.
+        this.sweepPromise(job.caseId, false);
+        job.channel = "email";
+        job.customMessage = await this.promiseReminderProvider?.(caseData)
+          || `Namaste ji, aapne ${promise.promisedDate} tak payment ka promise kiya tha. Aaj woh date aa gayi hai—kya aap abhi payment complete kar sakte hain? {{PAYMENT_LINK}}`;
+        this.persistJob(job);
+      }
+
       if (this.onExecuteIntervention) {
         await this.onExecuteIntervention(caseData, job);
       }
@@ -815,26 +875,54 @@ export class OrchestratorService {
     const caseData = this.cases.get(caseId);
     if (!caseData) return null;
 
+    // Date Gate: validate date format YYYY-MM-DD
+    const dateOnly = promisedDate.split("T")[0];
+    const targetTime = new Date(`${dateOnly}T04:30:00.000Z`).getTime();
+    if (isNaN(targetTime)) {
+      console.warn(`[Orchestrator] ⚠️ Invalid promise date "${promisedDate}" for ${caseId}`);
+      return null;
+    }
+
+    const now = Date.now();
+    const todayIst = new Date(now + 5.5 * 3600000).toISOString().split("T")[0];
+    const minTime = new Date(`${todayIst}T00:00:00.000Z`).getTime();
+    const maxTime = now + 30 * 86400000; // max 30 days ahead
+
+    if (targetTime < minTime || targetTime > maxTime) {
+      console.warn(`[Orchestrator] ⚠️ Promise date ${dateOnly} outside valid window (today..30d) for ${caseId}`);
+      return null;
+    }
+
+    // Promise Cap Gate: max 3 promises
+    const currentPromises = caseData.promiseCount || 0;
+    if (currentPromises >= 3) {
+      console.warn(`[Orchestrator] ⚠️ Case ${caseId} exceeded max promises cap (3)`);
+      return null;
+    }
+
+    caseData.promiseCount = currentPromises + 1;
+
     // Pause recovery sequence
     this.transitionState(caseId, "PAUSED_PROMISE",
-      `Customer promised payment by ${promisedDate}`
+      `Customer promised payment by ${dateOnly} (promise #${caseData.promiseCount})`
     );
 
     this.stats.totalPromisesReceived++;
 
-    // Schedule sweep at promised_date + 24h
-    const sweepAt = new Date(
-      new Date(promisedDate).getTime() + 24 * 3600000
-    ).toISOString();
+    // Schedule sweep at promised_date @ 10:00 IST (04:30 UTC)
+    const sweepAt = `${dateOnly}T04:30:00.000Z`;
 
     const sweepJob = this.scheduleJob({
       caseId,
       type: "promise_sweep",
       executeAt: sweepAt,
+      // The server's intervention handler delivers this job to both channels;
+      // email is retained as the canonical job channel for compatibility.
+      channel: "email",
     });
 
     caseData.promise = {
-      promisedDate,
+      promisedDate: dateOnly,
       promisedAmount,
       receivedAt: new Date().toISOString(),
       sweepJobId: sweepJob.id,
@@ -845,10 +933,50 @@ export class OrchestratorService {
     this.cancelCaseJobs(caseId, sweepJob.id);
 
     console.log(
-      `[Orchestrator] Promise recorded for ${caseId}: sweep at ${sweepAt}`
+      `[Orchestrator] Promise recorded for ${caseId}: sweep at ${sweepAt} (promise #${caseData.promiseCount}/3)`
     );
 
     return caseData;
+  }
+
+  /**
+   * Handle customer reply for pending two-step DPDP opt-out.
+   * If customer confirms YES -> SKIPPED_COMPLIANCE + durable DPDP registry write + cancel jobs + embed.
+   * If NO or other -> resumes recovery flow.
+   */
+  handleOptOutConfirmation(caseId: string, replyText: string): { confirmed: boolean; message: string } {
+    const caseData = this.cases.get(caseId);
+    if (!caseData) return { confirmed: false, message: "Case not found" };
+
+    const t = replyText.toLowerCase().trim();
+    const isYes = /\b(yes|haan|han|haa|confirm|kar do|kardo|band kar do|ok|okay|sure)\b/.test(t);
+    const isNo = /\b(no|nahi|nahin|cancel|rakho|rakhna|mat)\b/.test(t);
+
+    if (isYes) {
+      caseData.pendingOptOutConfirm = false;
+      caseData.dpdpOptedOut = true;
+      if (caseData.customerEmail) {
+        registerDpdpOptOut(caseData.customerEmail);
+      }
+      this.transitionState(caseId, "SKIPPED_COMPLIANCE", "DPDP opt-out confirmed by customer via two-step verification");
+      this.cancelCaseJobs(caseId);
+      void this.autoEmbedCase(caseData).catch(() => undefined);
+      return {
+        confirmed: true,
+        message: "✅ Confirm ho gaya ji. Aapko ab koi message/email nahi aayega — aapke din shubh ho! 🙏 (DPDP compliant)"
+      };
+    } else if (isNo) {
+      caseData.pendingOptOutConfirm = false;
+      return {
+        confirmed: false,
+        message: "Theek hai ji! Main aapko payment reminders continue rakhungi 😊 Kuch aur help chahiye?"
+      };
+    } else {
+      return {
+        confirmed: false,
+        message: "Confirm karne ke liye 'YES' likhein, ya reminders continue rakhne ke liye 'NO' likhein 🙏"
+      };
+    }
   }
 
   /**

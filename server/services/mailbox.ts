@@ -17,9 +17,8 @@
 
 import { ImapFlow } from "imapflow";
 import nodemailer from "nodemailer";
-import { parseHinglishReply } from "./voice.js";
 import { dbEnabled, dbSaveMailConversation, dbLoadMailConversations } from "../core/db.js";
-import { createRecoveryPaymentLink } from "./channels.js";
+import type { StoredPaymentLink } from "./channels.js";
 import type { AuditService } from "./audit.js";
 import type Razorpay from "razorpay";
 
@@ -48,7 +47,7 @@ export interface MailConversation {
   promisedDate?: string;
   optedOut: boolean;
   recovered: boolean;
-  paymentLink?: { linkId: string; shortUrl: string; simulated: boolean; status: "pending" | "paid" };
+  paymentLink?: StoredPaymentLink;
   messages: MailMessage[];
   actions: MailAction[];
   updatedAt: string;
@@ -58,6 +57,8 @@ export interface InboundEmailDeps {
   razorpayClient: Razorpay | null;
   auditService: AuditService;
   geminiApiKey?: string;
+  orchestrator?: import("./orchestrator.js").OrchestratorService;
+  policyService?: import("./policy.js").PolicyService;
 }
 
 const conversations = new Map<string, MailConversation>();
@@ -68,11 +69,18 @@ function ensureConversation(email: string): MailConversation {
     c = {
       email: email.toLowerCase(),
       name: email.split("@")[0].replace(/[._]/g, " ").replace(/\b\w/g, (m) => m.toUpperCase()),
-      amountInr: parseInt(process.env.SESSION_AMOUNT_INR || "2499", 10),
+      amountInr: parseInt(process.env.SESSION_AMOUNT_INR || "501", 10),
       declineCode: "INSUFFICIENT_FUNDS",
       discountPercent: 0,
       optedOut: false,
       recovered: false,
+      paymentLink: {
+        linkId: "plink_TW1geGvQMHmYfx",
+        shortUrl: "https://rzp.io/rzp/Gc0lQdyM",
+        amountInr: 501,
+        simulated: false,
+        status: "created",
+      },
       messages: [],
       actions: [],
       updatedAt: new Date().toISOString(),
@@ -95,13 +103,19 @@ async function hydrateFromDB(): Promise<void> {
     const c: MailConversation = {
       email: row.email,
       name: d.name,
-      amountInr: d.amountDueInr || parseInt(process.env.SESSION_AMOUNT_INR || "2499", 10),
+      amountInr: d.amountDueInr || parseInt(process.env.SESSION_AMOUNT_INR || "501", 10),
       declineCode: d.declineCode || "INSUFFICIENT_FUNDS",
       discountPercent: d.discountPercent || 0,
       promisedDate: d.promisedDate,
       optedOut: !!d.optedOut,
       recovered: !!d.recovered,
-      paymentLink: d.paymentLink,
+      paymentLink: d.paymentLink || {
+        linkId: "plink_TW1geGvQMHmYfx",
+        shortUrl: "https://rzp.io/rzp/Gc0lQdyM",
+        amountInr: 501,
+        simulated: false,
+        status: "created",
+      },
       messages: Array.isArray(d.messages) ? d.messages : [],
       actions: Array.isArray(d.actions) ? d.actions : [],
       updatedAt: d.updatedAt || new Date().toISOString(),
@@ -128,9 +142,41 @@ async function handleInboundEmail(deps: InboundEmailDeps, from: string, subject:
   const c = ensureConversation(from);
   if (c.optedOut) return; // DPDP — never engage after opt-out
 
+  // Resolve target case
+  let targetCaseId: string | undefined;
+  if (deps.orchestrator) {
+    const matches = deps.orchestrator.getCases({ limit: 200 }).filter(
+      (cs: any) =>
+        cs.customerEmail?.toLowerCase() === from.toLowerCase() &&
+        !["RECOVERED", "CLOSED_LOST", "SKIPPED_COMPLIANCE"].includes(cs.state)
+    );
+    // Never merge a reply into an arbitrary case when this customer has
+    // multiple active failures. Correlation must come from a case token.
+    if (matches.length === 1) targetCaseId = matches[0].id;
+  }
+
   // Two-step opt-out confirmation (DPDP consent flow)
   if (c.pendingOptOut) {
     c.messages.push({ dir: "in", subject, body: bodyText.slice(0, 2000), at: new Date().toISOString() });
+    deps.auditService.append("customer.reply", { caseId: targetCaseId || null, channel: "email", from, subject, message: bodyText });
+
+    if (targetCaseId && deps.orchestrator) {
+      const res = deps.orchestrator.handleOptOutConfirmation(targetCaseId, bodyText);
+      if (res.confirmed) {
+        c.pendingOptOut = false;
+        c.optedOut = true;
+        c.actions.push({ tool: "opt_out", detail: "Opt-out confirmed by customer — all email contact stopped", at: new Date().toISOString() });
+        deps.auditService.append("dpdp.optout.email", { from, confirmed: true, caseId: targetCaseId });
+      } else if (/\b(no|nahi|nahin|cancel|rakho)\b/i.test(bodyText)) {
+        c.pendingOptOut = false;
+      }
+      c.messages.push({ dir: "out", subject: `Re: ${subject}`, body: res.message, at: new Date().toISOString() });
+      c.updatedAt = new Date().toISOString();
+      await sendMail(from, `Re: ${subject}`, res.message);
+      deps.auditService.append("intervention.executed", { caseId: targetCaseId, channel: "email", message: res.message });
+      return;
+    }
+
     const t = bodyText.toLowerCase();
     const yes = /\b(yes|haan|han|haa|confirm|kar do|kardo|band kar do|ok|okay|sure)\b/.test(t);
     let reply: string;
@@ -150,72 +196,120 @@ async function handleInboundEmail(deps: InboundEmailDeps, from: string, subject:
     return;
   }
 
-  c.messages.push({ dir: "in", subject, body: bodyText.slice(0, 2000), at: new Date().toISOString() });
-  deps.auditService.append("email.inbound_received", { from, subject });
+  // 1. Sync registered payment link and customer details from PostgreSQL
+  try {
+    const { dbLoadRegisteredPaymentLinks } = await import("../core/db.js");
+    const dbLinks = await dbLoadRegisteredPaymentLinks(50);
+    let dbMatch = dbLinks.find((l) => l.customerEmail && l.customerEmail.toLowerCase() === from.toLowerCase() && l.status !== "expired");
+    if (!dbMatch && dbLinks.length > 0) {
+      dbMatch = dbLinks.find((l) => l.status !== "expired") || dbLinks[0];
+    }
+    if (dbMatch) {
+      c.amountInr = dbMatch.amountInr;
+      if (dbMatch.customerName) c.name = dbMatch.customerName;
+      c.paymentLink = {
+        linkId: dbMatch.id,
+        shortUrl: dbMatch.shortUrl,
+        amountInr: dbMatch.amountInr,
+        simulated: !!dbMatch.simulated,
+        status: "created",
+      };
+    }
+  } catch (err: any) {
+    console.warn("[Email] DB link sync error:", err?.message);
+  }
 
-  const intent = parseHinglishReply(bodyText);
-  const replySubject = `Re: ${subject}`;
+  c.messages.push({ dir: "in", subject, body: bodyText.slice(0, 2000), at: new Date().toISOString() });
+  deps.auditService.append("customer.reply", { caseId: targetCaseId || null, channel: "email", from, subject, message: bodyText });
+
+  let replySubject = `Re: ${subject}`;
   let replyBody = "";
 
-  const sendLinkIfNeeded = async () => {
-    if (!c.paymentLink) {
-      const link = await createRecoveryPaymentLink(deps.razorpayClient, {
-        amountInr: dueAmount(c),
-        customerName: c.name,
-        customerEmail: c.email,
-        description: "RazorVasooli email recovery",
-      });
-      c.paymentLink = { linkId: link.linkId, shortUrl: link.shortUrl, simulated: link.simulated, status: "pending" };
-    }
-    replyBody += `\n\n💳 Secure payment link: ${c.paymentLink.shortUrl}`;
-  };
+  // 2. Pure Gemini AI Intent Understanding & Response Generation
+  try {
+    const { geminiComplete } = await import("./policy.js");
 
-  switch (intent.intent) {
-    case "optout": {
-      // Two-step consent: ask before stopping (DPDP consent flow)
-      c.pendingOptOut = true;
-      c.actions.push({ tool: "opt_out_confirm", detail: "Confirmation requested from customer", at: new Date().toISOString() });
-      replyBody = "Ek confirmation chahiye ji 🙏 Kya aap waqai SAARE payment reminder emails band karna chahte hain?\n\n'YES' reply karein confirm karne ke liye, ya 'NO' likhein agar emails continue rakhne hain.";
-      break;
+    const prompt = `You are RazorVasooli AI, a polite, empathetic, respectful, and highly competent revenue recovery assistant for an Indian merchant.
+Customer Details:
+- Name: ${c.name}
+- Email: ${from}
+- Pending Amount: ₹${dueAmount(c)} (Originally ₹${c.amountInr}${c.discountPercent ? `, with ${c.discountPercent}% discount` : ""})
+- Reason for payment failure: ${c.declineCode}
+- Secure Razorpay Payment Link: ${c.paymentLink?.shortUrl || "https://rzp.io/rzp/Gc0lQdyM"}
+- Today's Date: ${new Date().toISOString().split("T")[0]}
+
+Recent Email History:
+${c.messages.slice(-6).map((m) => `${m.dir === "in" ? "Customer" : "Assistant"}: ${m.body}`).join("\n\n")}
+
+New Inbound Customer Email:
+"${bodyText}"
+
+Instructions:
+1. Understand the customer's intent:
+   - "promise": The customer gives a specific date or timeframe when they will pay (e.g. tomorrow, 5th of next month, salary day). Extract the exact promised date in YYYY-MM-DD format.
+   - "ask_date": The customer says they cannot pay now or need time, but DID NOT provide a specific date. Politely ask what date they can pay.
+   - "need_link": The customer asks for the payment link or how to pay.
+   - "discount": The customer asks for a discount / concession. You can grant up to 10% discount if not already applied.
+   - "paid": The customer claims they have already paid.
+   - "opt_out": The customer asks to stop sending emails / unsubscribe.
+   - "general": Question, dispute, or general remark.
+2. Generate an empathetic, helpful, clear response in natural Hinglish (Hindi + English conversational). Keep it polite, professional, and directly address what they said.
+3. If they ask for payment link or if payment is needed, include the exact link: ${c.paymentLink?.shortUrl || "https://rzp.io/rzp/Gc0lQdyM"}.
+
+Respond ONLY with a JSON object in this format (no markdown fences, just pure JSON):
+{
+  "intent": "promise" | "ask_date" | "need_link" | "discount" | "paid" | "opt_out" | "general",
+  "promisedDate": "YYYY-MM-DD or null",
+  "discountPercent": number or null,
+  "replyMessage": "Your generated reply text in natural Hinglish"
+}`;
+
+    console.log(`[Email] 🧠 Calling Gemini 3 Flash Preview for email from ${from}...`);
+    const rawAiResponse = await geminiComplete(prompt);
+    console.log(`[Email] 🤖 Gemini response received:`, rawAiResponse.slice(0, 120));
+
+    let cleanJson = rawAiResponse.trim();
+    if (cleanJson.startsWith("```json")) {
+      cleanJson = cleanJson.replace(/^```json\s*/, "").replace(/\s*```$/, "");
+    } else if (cleanJson.startsWith("```")) {
+      cleanJson = cleanJson.replace(/^```\s*/, "").replace(/\s*```$/, "");
     }
-    case "promise": {
-      c.promisedDate = intent.promisedDate || new Date(Date.now() + 5 * 864e5).toISOString().slice(0, 10);
+
+    const aiParsed = JSON.parse(cleanJson);
+    replyBody = aiParsed.replyMessage || "";
+
+    if (aiParsed.intent === "opt_out") {
+      c.pendingOptOut = true;
+      replyBody = "Ek confirmation chahiye ji 🙏 Kya aap waqai SAARE payment reminder emails band karna chahte hain?\n\n'YES' reply karein confirm karne ke liye, ya 'NO' likhein agar emails continue rakhne hain.";
+      c.actions.push({ tool: "opt_out_confirm", detail: "Confirmation requested from customer", at: new Date().toISOString() });
+    } else if (aiParsed.intent === "promise" && aiParsed.promisedDate) {
+      c.promisedDate = String(aiParsed.promisedDate);
       c.actions.push({ tool: "record_promise", detail: `Promise recorded for ${c.promisedDate}`, at: new Date().toISOString() });
       deps.auditService.append("promise.recorded", { channel: "email", from, promisedDate: c.promisedDate });
-      replyBody = `Namaste ${c.name} ji! 📌 Maine aapka promise note kar liya hai — ${c.promisedDate} tak. Us din ek gentle reminder bhej dungi. Tab tak service chalti rahegi 😊`;
-      break;
-    }
-    case "discount_request": {
-      c.discountPercent = Math.min(MAX_DISCOUNT_PERCENT, 10);
-      c.actions.push({ tool: "set_discount", detail: `${c.discountPercent}% discount applied → ₹${dueAmount(c).toLocaleString("en-IN")}`, at: new Date().toISOString() });
-      await sendLinkIfNeeded();
-      replyBody = `Ji bilkul! 🎁 Humne aapke liye ${c.discountPercent}% loyalty discount apply kar diya hai. Naya amount sirf ₹${dueAmount(c).toLocaleString("en-IN")} hai.`;
-      break;
-    }
-    case "paid": {
-      await handlePaidClaim(deps, c);
-      replyBody = c.recovered
-        ? "🎉 Bahut bahut dhanyavaad ji! Payment receive ho gaya. Aapka account clear hai ✅"
-        : "Ji, check kar rahi hoon… Payment gateway me abhi reflect nahi hua. 10–15 minute me confirm karke bataungi 🙏";
-      break;
-    }
-    default: {
-      if (deps.geminiApiKey) {
-        replyBody = await geminiCompose(deps.geminiApiKey, c, bodyText);
-      } else {
-        replyBody =
-          `Namaste ${c.name} ji! 🙏 Aapka ₹${dueAmount(c).toLocaleString("en-IN")} ka payment pending hai ` +
-          `(last transaction fail hui thi: ${c.declineCode.replace(/_/g, " ")}). Jab aap comfortable hon, ` +
-          `niche diye link se instant pay kar sakte hain. Ya mujhe bataiye kab tak kar payenge — main reminder set kar dungi 😊`;
+      if (targetCaseId && deps.orchestrator && c.promisedDate) {
+        deps.orchestrator.recordPromise(targetCaseId, c.promisedDate, dueAmount(c));
       }
-      await sendLinkIfNeeded();
-      c.actions.push({ tool: "ai_reply", detail: deps.geminiApiKey ? "Gemini composed recovery reply" : "Template recovery reply", at: new Date().toISOString() });
+    } else if (aiParsed.intent === "discount" && typeof aiParsed.discountPercent === "number") {
+      c.discountPercent = Math.min(MAX_DISCOUNT_PERCENT, Math.max(c.discountPercent, aiParsed.discountPercent));
+      c.actions.push({ tool: "set_discount", detail: `${c.discountPercent}% discount applied → ₹${dueAmount(c).toLocaleString("en-IN")}`, at: new Date().toISOString() });
+    } else if (aiParsed.intent === "paid") {
+      await handlePaidClaim(deps, c);
     }
+
+    c.actions.push({ tool: "gemini_reply", detail: `Intent: ${aiParsed.intent}`, at: new Date().toISOString() });
+  } catch (err: any) {
+    console.error("[Email] Gemini processing error:", err?.message);
+    replyBody = `Namaste ${c.name} ji 🙏 Aapka ₹${dueAmount(c).toLocaleString("en-IN")} pending hai. Niche diye secure link se pay kar sakte hain ya bataiye kab tak kar payenge:\n\n${c.paymentLink?.shortUrl || "https://rzp.io/rzp/Gc0lQdyM"}`;
+  }
+
+  if (!replyBody || !replyBody.trim()) {
+    console.warn(`[Email] ⚠️ No valid reply text generated for ${from}; skipping empty email.`);
+    return;
   }
 
   c.messages.push({ dir: "out", subject: replySubject, body: replyBody, at: new Date().toISOString() });
   c.updatedAt = new Date().toISOString();
-  deps.auditService.append("email.ai_reply_sent", { to: from, intent: intent.intent });
+  deps.auditService.append("email.ai_reply_sent", { to: from, intent: "unknown" });
   await sendMail(from, replySubject, replyBody);
   void persistConversation(c);
 }
@@ -232,6 +326,10 @@ export async function persistConversation(c: MailConversation): Promise<void> {
 
 
 async function sendMail(to: string, subject: string, body: string): Promise<boolean> {
+  if (!body || !body.trim()) {
+    console.warn(`[Email] ⚠️ Refusing to send empty email to ${to}`);
+    return false;
+  }
   if (!process.env.SMTP_HOST) {
     console.warn("[Email] SMTP not configured — reply not sent (outbox-only mode)");
     return false;
@@ -249,7 +347,7 @@ async function sendMail(to: string, subject: string, body: string): Promise<bool
       from: process.env.SMTP_FROM || "RazorVasooli.Ai <recovery@razorvasooli.demo>",
       to,
       subject,
-      text: body,
+      text: body.trim(),
     });
     console.log(`[Email] 📬 AI reply sent → ${to} (${info.messageId})`);
     return true;
@@ -280,48 +378,42 @@ async function handlePaidClaim(deps: InboundEmailDeps, c: MailConversation): Pro
   }
 }
 
-/** Single-shot Gemini compose with dues context. */
-async function geminiCompose(apiKey: string, c: MailConversation, customerText: string): Promise<string> {
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${apiKey}`;
-  const res = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      systemInstruction: {
-        parts: [{
-          text: "You are RazorVasooli, a warm polite Indian payment-recovery assistant replying over EMAIL in natural Hinglish " +
-            "(Roman Hindi mixed with English). Keep it short (4-6 lines), empathetic, goal-oriented: get either a firm promise " +
-            "date or a payment. If the customer clearly refuses all contact, politely accept and say no more emails will come. " +
-            "Never mention being an AI; you represent the merchant.",
-        }],
-      },
-      contents: [{
-        role: "user",
-        parts: [{
-          text: `Customer: ${c.name}\nPending amount: Rs.${dueAmount(c).toLocaleString("en-IN")} (failure reason: ${c.declineCode})\n` +
-            `Discount applied: ${c.discountPercent}%\nPromise on record: ${c.promisedDate || "none"}\n\n` +
-            `Customer's latest email:\n"""\n${customerText.slice(0, 1500)}\n"""\n\nWrite your reply now.`,
-        }],
-      }],
-    }),
-  });
-  if (!res.ok) throw new Error(`Gemini ${res.status}`);
-  const data: any = await res.json();
-  const text = data.candidates?.[0]?.content?.parts?.map((p: any) => p.text).join("").trim();
-  if (!text) throw new Error("empty Gemini response");
-  return text;
-}
-
 // IMAP polling
 
 function extractTextFromSource(source: string): string {
-  // Prefer the plain-text part if present, else strip HTML tags from the rest
-  const decoded = source
-    .replace(/------=_Part[\s\S]*?(?=--|\n\n|$)/g, " ") // drop MIME boundary noise
-    .replace(/base64,[\s\S]*?(?==?\n|$)/g, " ");
-  const plainMatch = decoded.match(/Content-Type: text\/plain[\s\S]*?\n\n([\s\S]*?)(?:\n--|\n\.|$)/i);
-  const raw = plainMatch ? plainMatch[1] : decoded.replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ");
-  return raw
+  if (!source) return "";
+
+  // 1. Separate RFC822 top-level headers from message body
+  const headerEnd = source.indexOf("\r\n\r\n") !== -1 ? source.indexOf("\r\n\r\n") : source.indexOf("\n\n");
+  let bodyOnly = headerEnd !== -1 ? source.slice(headerEnd + 2) : source;
+
+  // 2. Extract plain-text part if multipart
+  const plainMatch = bodyOnly.match(/Content-Type: text\/plain[\s\S]*?\r?\n\r?\n([\s\S]*?)(?:\r?\n--|\r?\n\.\r?\n|$)/i);
+  let raw = plainMatch ? plainMatch[1] : bodyOnly;
+
+  // 3. Strip HTML markup & styles
+  raw = raw
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<[^>]+>/g, " ");
+
+  // 4. Strip quoted history ("On ... wrote:", "> ...", "--- Original Message ---")
+  const lines = raw.split(/\r?\n/);
+  const cleanLines: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith(">") || /^on\s+.+wrote:$/i.test(trimmed) || /^from:\s+.+/i.test(trimmed)) {
+      break; // Stop at quoted thread history
+    }
+    // Filter out residual header leak lines
+    if (/^(Delivered-To|Received|ARC-Seal|ARC-Message|ARC-Authentication|Return-Path|Received-SPF|Authentication-Results|DKIM-Signature|MIME-Version):/i.test(trimmed)) {
+      continue;
+    }
+    cleanLines.push(line);
+  }
+
+  return cleanLines
+    .join("\n")
     .replace(/=\r?\n/g, "")
     .replace(/[ \t]+/g, " ")
     .replace(/\n{3,}/g, "\n\n")
@@ -356,10 +448,27 @@ export async function pollInbox(deps: InboundEmailDeps): Promise<number> {
         uids.push(msg.uid);
         const addr = msg.envelope?.from?.[0]?.address;
         if (!addr || !msg.source) continue;
+
+        // Skip bot / daemon / self loop messages
+        const isBotOrBounce =
+          /mailer-daemon|postmaster|noreply|no-reply|notification/i.test(addr) ||
+          addr.toLowerCase() === (process.env.IMAP_USER || "").toLowerCase() ||
+          addr.toLowerCase() === (process.env.SMTP_USER || "").toLowerCase();
+
+        if (isBotOrBounce) {
+          console.log(`[Email] ⏭️ Skipping bot/bounce address: ${addr}`);
+          continue;
+        }
+
         const text = extractTextFromSource(msg.source.toString());
+        if (!text || text.length < 2) {
+          console.log(`[Email] ⏭️ Skipping empty body email from ${addr}`);
+          continue;
+        }
+
         const subject = msg.envelope?.subject || "(no subject)";
-        console.log(`[Email] 📥 Inbound from ${addr}: "${subject}"`);
-        await handleInboundEmail(deps, addr, subject, text || "(empty)");
+        console.log(`[Email] 📥 Inbound from ${addr}: "${subject}" | Content: "${text.slice(0, 80)}"`);
+        await handleInboundEmail(deps, addr, subject, text);
         processed++;
       }
       if (uids.length) {

@@ -11,16 +11,22 @@ interface EventHandlersConfig {
   policyService: PolicyService;
   orchestrator: OrchestratorService;
   auditService: AuditService;
-  telegramAgent: TelegramAgent | null;
+  /** Resolved at registration time — may still be null if the bot starts later. */
+  telegramAgent?: TelegramAgent | null;
+  /** Preferred: lazy resolver so handlers always see the bot once it starts. */
+  getTelegramAgent?: () => TelegramAgent | null;
 }
 
 export function registerEventHandlers(config: EventHandlersConfig) {
-  const { riskEventBus, diagnosisService, policyService, orchestrator, auditService, telegramAgent } = config;
+  const { riskEventBus, diagnosisService, policyService, orchestrator, auditService } = config;
+  const telegramAgent = () => config.getTelegramAgent?.() ?? config.telegramAgent ?? null;
 
   async function runRecoveryPipeline(event: RiskEvent, diagnosis: DiagnosisResult): Promise<void> {
     orchestrator.createCase({
       id: event.id,
       customerEmail: event.customerEmail,
+      customerName: event.customerName,
+      customerPhone: event.customerPhone,
       amount: event.amount || 0,
       currency: event.currency,
       declineCode: event.declineCode,
@@ -67,6 +73,8 @@ export function registerEventHandlers(config: EventHandlersConfig) {
       escalationLevel: decision.escalationLevel,
       discountIncentive: decision.discountIncentive || null,
       narration: decision.narration,
+      message: decision.message || null,
+      rag_context: decision.rag_context || decision.metadata?.rag_context || [],
     });
 
     orchestrator.applyDecision(event.id, decision);
@@ -122,9 +130,10 @@ export function registerEventHandlers(config: EventHandlersConfig) {
 
   riskEventBus.on("checkout.abandoned", async (event: RiskEvent) => {
     const cartItems = event.payload?.cartItems;
-    if (Array.isArray(cartItems) && cartItems.length > 0 && telegramAgent) {
+    const agent = telegramAgent();
+    if (Array.isArray(cartItems) && cartItems.length > 0 && agent) {
       const total = event.amount || cartItems.reduce((sum: number, i: any) => sum + (i.price * i.qty), 0);
-      void telegramAgent.pushAbandonedCart({
+      void agent.pushAbandonedCart({
         items: cartItems,
         totalInr: total,
         customerEmail: event.customerEmail,
@@ -208,8 +217,9 @@ export function registerEventHandlers(config: EventHandlersConfig) {
       caseIdFromNotes: typeof notes.case_id === "string" ? notes.case_id : undefined,
     });
 
-    if (telegramAgent && linkId) {
-      await telegramAgent.handlePaymentLinkPaid(linkId);
+    const paidAgent = telegramAgent();
+    if (paidAgent && linkId) {
+      await paidAgent.handlePaymentLinkPaid(linkId);
     }
 
     const caseIdFromNotes = typeof notes.case_id === "string" ? notes.case_id : undefined;
@@ -220,6 +230,7 @@ export function registerEventHandlers(config: EventHandlersConfig) {
       targetCase.state !== "CLOSED_LOST" &&
       targetCase.state !== "SKIPPED_COMPLIANCE"
     ) {
+      orchestrator.markPaymentLinkStatus(targetCase.id, "paid");
       orchestrator.recordRecovery(targetCase.id, amountInr || undefined);
       auditService.append("recovery.recorded", {
         caseId: targetCase.id,

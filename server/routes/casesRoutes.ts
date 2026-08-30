@@ -1,6 +1,6 @@
 // AUTO-GENERATED (Pass 2) — cases routes. Handlers verbatim moved from index.ts.
 import express, { type Request, type Response } from "express";
-import { createRecoveryPaymentLink } from "../services/channels.js";
+import { getOrCreateRecoveryPaymentLink } from "../services/channels.js";
 import type { CaseState } from "../services/orchestrator.js";
 
 export function registerCasesRoutes(app: express.Express, ctx: Record<string, any>): void {
@@ -151,7 +151,7 @@ app.post("/api/orchestrator/cases/:caseId/escalation-action", async (req: Reques
     }
     case "offer_discount": {
       const discountedAmount = Math.round(caseData.amount * 0.95); // 5% discount
-      const link = await createRecoveryPaymentLink(razorpayClient, {
+      const { link, reused } = await getOrCreateRecoveryPaymentLink(razorpayClient, caseData.paymentLink, {
         amountInr: discountedAmount,
         customerName: caseData.customerName,
         customerEmail: caseData.customerEmail,
@@ -159,10 +159,12 @@ app.post("/api/orchestrator/cases/:caseId/escalation-action", async (req: Reques
         description: `Settlement offer with 5% discount for ${caseId}`,
         notes: { case_id: caseId, discount: "5%" },
       });
+      orchestrator.recordPaymentLink(caseId, link);
       auditService.append("escalation.discount_offered", {
         caseId,
         discountedAmount,
         paymentLink: link.shortUrl,
+        paymentLinkReused: reused,
       });
       return res.status(200).json({
         success: true,
@@ -171,6 +173,7 @@ app.post("/api/orchestrator/cases/:caseId/escalation-action", async (req: Reques
         discountedAmount,
         paymentLink: link.shortUrl,
         simulated: link.simulated,
+        paymentLinkReused: reused,
       });
     }
     case "write_off": {

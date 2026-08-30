@@ -6,7 +6,7 @@ import type { CheckoutBeacon, RiskEventType, RiskEvent } from "../services/inges
 import { classifyRiskSeverity } from "../services/ingestion.js";
 
 export function registerIngestionRoutes(app: express.Express, ctx: Record<string, any>): void {
-  const { deduplicator, riskEventBus, pollerState, startPoller, pollInvoices } = ctx;
+  const { deduplicator, riskEventBus, pollerState, startPoller, pollInvoices, trackedInvoices } = ctx;
 
 app.post("/api/ingestion/beacon", async (req: Request, res: Response) => {
   const beacon: CheckoutBeacon = req.body;
@@ -71,6 +71,14 @@ app.post("/api/ingestion/poller/stop", (_req: Request, res: Response) => {
 app.post("/api/ingestion/poller/poll-now", async (_req: Request, res: Response) => {
   const result = await pollInvoices();
   return res.status(200).json({ status: "polled", ...result });
+});
+
+app.post("/api/ingestion/poller/track", (req: Request, res: Response) => {
+  if (!req.body || !req.body.id) {
+    return res.status(400).json({ error: "Invalid invoice data" });
+  }
+  trackedInvoices.push(req.body);
+  return res.status(200).json({ status: "tracked", id: req.body.id });
 });
 
 app.get("/api/ingestion/poller/status", (_req: Request, res: Response) => {

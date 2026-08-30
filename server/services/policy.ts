@@ -12,9 +12,62 @@
  */
 
 import { type FailureCategory, type TaxonomyEntry, type RecoverabilityResult } from "./diagnosis.js";
+import type { CaseState } from "./orchestrator.js";
 import { metrics } from "../core/metrics.js";
-import { rankChannelsBySuccess, getCategorySummary } from "./outcomeMemory.js";
 import { findSimilarCases } from "./embeddings.js";
+
+async function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+export async function geminiComplete(prompt: string): Promise<string> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error("GEMINI_API_KEY missing");
+
+  const preferredModel = process.env.GEMINI_MODEL || "gemini-3.5-flash";
+  const modelCandidates = Array.from(
+    new Set([preferredModel, "gemini-3.5-flash", "gemini-3.7-flash"])
+  );
+
+  let lastError: Error | null = null;
+
+  for (const model of modelCandidates) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+        });
+
+        if (res.status === 429) {
+          console.warn(`[Gemini] Model ${model} hit 429; cascading to next candidate...`);
+          await sleep(500);
+          break; // Try next model immediately
+        }
+
+        if (!res.ok) {
+          const errText = await res.text();
+          lastError = new Error(`Gemini ${model} Error ${res.status}: ${errText}`);
+          break;
+        }
+
+        const data = (await res.json()) as {
+          candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+        };
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (text) return text;
+      } catch (err: any) {
+        lastError = err;
+        await sleep(500);
+      }
+    }
+  }
+
+  throw lastError || new Error("Gemini generation failed across all model candidates");
+}
 
 // Types & Interfaces
 
@@ -61,6 +114,11 @@ export interface PolicyDecision {
   /** Veto details, if agent was overridden */
   vetoReason?: string;
   decidedAt: string;
+  /** Personalized message */
+  message?: string;
+  state?: CaseState;
+  metadata?: Record<string, any>;
+  rag_context?: string[];
 }
 
 export interface PolicyInput {
@@ -187,16 +245,8 @@ export function computeAllowedActions(input: PolicyInput): AllowedActionSet {
       break;
   }
 
-  // High-value transactions (>₹1L) require voice escalation option
-  if (amount > 100000 && !channels.includes("voice_call")) {
-    channels.push("voice_call");
-  }
-
-  // Subscription-halted cases always get update link option
-  if (isSubscription && !channels.includes("subscription_update_link")) {
-    channels.push("subscription_update_link");
-    allowSubscriptionUpdate = true;
-  }
+  channels = ["telegram", "email"];
+  allowSubscriptionUpdate = false;
 
   return {
     channels,
@@ -229,8 +279,7 @@ export function applyBaselineRule(
   // category. Memory can only REORDER the rules-based allowed set — it can
   // never add/remove channels or bypass discounts/escalation caps. Cold
   // start (no data) preserves the original static priority order.
-  const ranked = rankChannelsBySuccess(input.category, allowedActions.channels);
-  const channel = ranked[0] as Channel;
+  const channel = allowedActions.channels[0];
 
   // Pick optimal delay: match with timing hint from diagnosis
 
@@ -275,30 +324,17 @@ export interface AgentChoice {
   escalationLevel: EscalationLevel;
   discountIncentive: number;
   narration: string;
-}
-
-/**
- * Phase L1: measured historical performance for this category — lets the LLM
- * reason WITH evidence instead of priors alone. Empty when memory is cold.
- */
-function buildPerformanceSection(category: FailureCategory): string {
-  const perf = getCategorySummary(category, 6);
-  if (perf.length === 0) return "";
-  const lines = perf.map((p) =>
-    ` - **${p.channel}**: ${Math.round(p.rate * 100)}% recovered (${p.recovered}/${p.attempted} attempts)`
-  );
-  return `\n## 📊 Historical Performance for ${category}\n${lines.join("\n")}\nPrefer higher-performing channels when it fits the customer context.\n`;
+  message?: string;
+  state: CaseState;
+  metadata?: Record<string, any>;
 }
 
 /**
  * Phase L2: retrieve similar past cases and format for the LLM prompt.
  * Returns empty string when no embeddings exist (cold start / no API key).
  */
-async function buildSimilarCasesSection(input: PolicyInput): Promise<string> {
-  const queryText = `${input.category} ₹${input.amount} ${input.declineCode || ""} ${input.paymentMethod || ""} attempt ${input.retryCount}`;
-  
-  const similar = await findSimilarCases(queryText, input.category, 3, 0.65);
-  if (similar.length === 0) return "";
+export function formatSimilarCases(similar: Array<{ caseId: string; amountInr: number; channel: string; discount: number; similarity: number; recovered: boolean; narrative: string }>): string {
+  if (!similar || similar.length === 0) return "";
 
   const lines = similar.map((s, i) =>
     `${i + 1}. [${s.recovered ? "✅ RECOVERED" : "❌ LOST"}] ₹${s.amountInr.toLocaleString("en-IN")} via **${s.channel}**${s.discount > 0 ? ` (${s.discount}% discount)` : ""} — similarity ${Math.round(s.similarity * 100)}%\n   ${s.narrative}`
@@ -310,7 +346,15 @@ async function buildSimilarCasesSection(input: PolicyInput): Promise<string> {
 /**
  * Build the prompt for the LLM agent to reason about the best intervention.
  */
-export async function buildAgentPrompt(input: PolicyInput, allowedActions: AllowedActionSet): Promise<string> {
+export async function buildAgentPrompt(
+  input: PolicyInput,
+  allowedActions: AllowedActionSet,
+  similarCases?: Array<{ caseId: string; amountInr: number; channel: string; discount: number; similarity: number; recovered: boolean; narrative: string }>
+): Promise<string> {
+  const queryText = `${input.category} ₹${input.amount} ${input.declineCode || ""} ${input.paymentMethod || ""} attempt ${input.retryCount}`;
+  const similar = similarCases !== undefined ? similarCases : await findSimilarCases(queryText, input.category, 3, 0.65);
+  const similarSection = formatSimilarCases(similar);
+
   return `You are an intelligent Indian revenue recovery agent for a SaaS company using Razorpay.
 
 ## Case Context
@@ -330,17 +374,28 @@ export async function buildAgentPrompt(input: PolicyInput, allowedActions: Allow
 - **Delay Windows (hours)**: ${JSON.stringify(allowedActions.delayWindows)}
 - **Max Discount**: ${allowedActions.maxDiscountPercent}%
 - **Attempt**: ${allowedActions.currentAttempt} of ${allowedActions.maxAttempts}
-${buildPerformanceSection(input.category)}
-${await buildSimilarCasesSection(input)}
+${similarSection}
 ## Your Task
 Choose the single best intervention and explain your reasoning in a plain-English narration (1-2 sentences).
 
+## Personalization Mandate
+The similar past cases are REAL conversation outcomes. Mirror what worked:
+if a similar customer recovered after a salary-date promise + 2 telegram
+nudges, use that exact sequence and tone. You are choosing for THIS
+customer right now.
+
 Respond in STRICT JSON only:
 {
-  "channel": "<one of the allowed channels>",
+  "channel": "telegram" | "email",
   "delayHours": <one of the allowed delay windows>,
   "escalationLevel": "<none|soft_reminder|urgent_reminder|final_notice|human_escalation>",
   "discountIncentive": <0 to ${allowedActions.maxDiscountPercent}>,
+  "message": "<the actual Hinglish message to send this customer now — max 2 sentences, references their situation. Must include questions like 'Should I generate a payment link?' or 'Do you want to opt out?' if relevant>",
+  "state": "<INTERVENING|PAUSED_PROMISE|ESCALATED|CLOSED_LOST|SKIPPED_COMPLIANCE>",
+  "metadata": {
+    "date": "<YYYY-MM-DD>" // ONLY if state is PAUSED_PROMISE
+    // Include any other state-specific metadata as needed
+  },
   "narration": "<plain-English reasoning>"
 }`;
 }
@@ -369,69 +424,95 @@ export function parseAgentResponse(llmResponse: string): AgentChoice | null {
         : "soft_reminder",
       discountIncentive: Number(parsed.discountIncentive) || 0,
       narration: parsed.narration || "Agent chose intervention",
+      message: String(parsed.message || "").slice(0, 400),
+      state: parsed.state || "INTERVENING",
+      metadata: parsed.metadata || {},
     };
   } catch {
     return null;
   }
 }
 
-/**
- * Determine if a case qualifies for agent reasoning (ambiguous zone).
- * Cases with score ∈ [0.35, 0.70] or high-value (>₹25K) benefit from AI reasoning.
- */
-export function shouldUseAgent(input: PolicyInput): boolean {
-  const score = input.recoverability.score;
-  const isAmbiguous = score >= 0.35 && score <= 0.70;
-  const isHighValue = input.amount > 25000;
-  return isAmbiguous || isHighValue;
-}
+// `shouldUseAgent` removed as part of L2-only migration.
 
 // 4. TASK 4.4: Rules Veto Guardrail
 //    Validates Agent's choice against the Allowed Action Set
 
-interface VetoResult {
-  isValid: boolean;
-  violations: string[];
-}
-
 /**
- * Validate an agent's choice against the allowed action set.
- * Returns whether the choice is valid and any violations found.
+ * Validate an agent's choice against the allowed action set and state rules.
+ * Returns the clamped decision and any violations found (Step 2a).
  */
-export function vetoCheck(choice: AgentChoice, allowedActions: AllowedActionSet): VetoResult {
+export function validateAgentDecision(
+  currentState: CaseState,
+  choice: AgentChoice, 
+  allowedActions: AllowedActionSet
+): { decision: AgentChoice, vetoReason?: string } {
   const violations: string[] = [];
 
   // Check 1: Channel must be in allowed set
   if (!allowedActions.channels.includes(choice.channel)) {
-    violations.push(`Channel "${choice.channel}" not in allowed set [${allowedActions.channels.join(", ")}]`);
+    violations.push(`Channel "${choice.channel}" not allowed`);
+    choice.channel = allowedActions.channels[0]; // clamp
   }
 
-  // Check 2: Delay must be in allowed windows (allow 10% tolerance)
+  // Check 2: Delay must be in allowed windows
   const isValidDelay = allowedActions.delayWindows.some(
     (d) => Math.abs(choice.delayHours - d) <= d * 0.1 + 0.1
   );
   if (!isValidDelay) {
-    violations.push(`Delay ${choice.delayHours}h not in allowed windows [${allowedActions.delayWindows.join(", ")}]`);
+    violations.push(`Delay ${choice.delayHours}h not allowed`);
+    choice.delayHours = allowedActions.delayWindows[0] || 0; // clamp
   }
 
-  // Check 3: Discount must not exceed maximum
+  // Check 3: Discount cap
   if (choice.discountIncentive > allowedActions.maxDiscountPercent) {
     violations.push(`Discount ${choice.discountIncentive}% exceeds max ${allowedActions.maxDiscountPercent}%`);
+    choice.discountIncentive = allowedActions.maxDiscountPercent; // clamp
   }
-
-  // Check 4: Discount must be non-negative
   if (choice.discountIncentive < 0) {
-    violations.push(`Discount ${choice.discountIncentive}% is negative`);
+    choice.discountIncentive = 0; // clamp
   }
 
-  // Check 5: Cannot exceed max attempts
-  if (allowedActions.currentAttempt > allowedActions.maxAttempts) {
-    violations.push(`Attempt ${allowedActions.currentAttempt} exceeds max ${allowedActions.maxAttempts}`);
+  // Check 4: State Transition Rules (Determinism Guard)
+  // RECOVERED is webhook-only, SKIPPED_COMPLIANCE is confirm-flow only
+  if (choice.state === "RECOVERED") {
+    violations.push("RECOVERED state is webhook-only, agent cannot propose it");
+    choice.state = "INTERVENING";
+  }
+  
+  if (choice.state === "SKIPPED_COMPLIANCE") {
+    violations.push("SKIPPED_COMPLIANCE is system-only via confirm flow");
+    choice.state = "INTERVENING";
+  }
+
+  const agentAllowedStates: CaseState[] = ["INTERVENING", "PAUSED_PROMISE", "CLOSED_LOST", "ESCALATED"];
+  if (!agentAllowedStates.includes(choice.state)) {
+    violations.push(`Agent cannot transition to arbitrary state ${choice.state}`);
+    choice.state = "INTERVENING";
+  }
+
+  // The agent may classify a reply, but cannot skip the deterministic state
+  // machine. This check is deliberately duplicated here so an invalid choice
+  // is vetoed before it reaches the Orchestrator.
+  const validNext: Record<CaseState, readonly CaseState[]> = {
+    DETECTED: ["INTERVENING"],
+    DIAGNOSED: ["INTERVENING", "ESCALATED", "CLOSED_LOST"],
+    POLICY_SELECTED: ["INTERVENING", "PAUSED_PROMISE", "ESCALATED", "CLOSED_LOST"],
+    INTERVENING: ["INTERVENING", "PAUSED_PROMISE", "ESCALATED", "CLOSED_LOST"],
+    PAUSED_PROMISE: ["INTERVENING", "ESCALATED", "CLOSED_LOST"],
+    RECOVERED: [],
+    ESCALATED: [],
+    CLOSED_LOST: [],
+    SKIPPED_COMPLIANCE: [],
+  };
+  if (!validNext[currentState].includes(choice.state)) {
+    violations.push(`State ${choice.state} is not reachable from ${currentState}`);
+    choice.state = "INTERVENING";
   }
 
   return {
-    isValid: violations.length === 0,
-    violations,
+    decision: choice,
+    vetoReason: violations.length > 0 ? violations.join("; ") : undefined,
   };
 }
 
@@ -455,7 +536,10 @@ export class PolicyService {
 
   constructor(maxLogSize: number = 200, llmCall?: (prompt: string) => Promise<string>) {
     this.maxLogSize = maxLogSize;
-    this.llmCall = llmCall;
+    this.llmCall = llmCall || (process.env.NODE_ENV !== "test" ? geminiComplete : undefined);
+    if (this.llmCall) {
+      console.log("[Policy] Agent LLM bound");
+    }
   }
 
   /**
@@ -487,44 +571,47 @@ export class PolicyService {
       return decision;
     }
 
-    // Step 3: Should we use the AI agent?
-    if (shouldUseAgent(input) && this.llmCall) {
+    // Step 3: Use the AI agent unconditionally if available
+    if (this.llmCall) {
       try {
-        const prompt = await buildAgentPrompt(input, allowedActions);
+        const queryText = `${input.category} ₹${input.amount} ${input.declineCode || ""} ${input.paymentMethod || ""} attempt ${input.retryCount}`;
+        const similar = await findSimilarCases(queryText, input.category, 3, 0.65);
+        const ragContextIds = similar.map((s) => s.caseId);
+
+        const prompt = await buildAgentPrompt(input, allowedActions, similar);
         const llmResponse = await this.llmCall(prompt);
         const agentChoice = parseAgentResponse(llmResponse);
 
         if (agentChoice) {
-          // Step 4: Veto check
-          const veto = vetoCheck(agentChoice, allowedActions);
+          // Step 4: Veto check and clamp
+          const { decision: clampedChoice, vetoReason } = validateAgentDecision(
+            "DIAGNOSED",
+            agentChoice, 
+            allowedActions
+          );
 
-          if (veto.isValid) {
-            // Agent's choice passes veto → use it
-            const decision: PolicyDecision = {
-              caseId: input.caseId,
-              channel: agentChoice.channel,
-              delayHours: agentChoice.delayHours,
-              escalationLevel: agentChoice.escalationLevel,
-              discountIncentive: agentChoice.discountIncentive,
-              decisionSource: "agent",
-              narration: agentChoice.narration,
-              allowedActions,
-              decidedAt: new Date().toISOString(),
-            };
-            this.recordDecision(decision);
-            return decision;
-          } else {
-            // Agent violated rules → fallback to baseline with veto flag
-            console.warn(
-              `[Policy] ⚠️ Agent vetoed for ${input.caseId}: ${veto.violations.join("; ")}`
-            );
-            const fallback = applyBaselineRule(input, allowedActions);
-            fallback.decisionSource = "agent_vetoed";
-            fallback.vetoReason = veto.violations.join("; ");
-            fallback.narration = `[VETOED] Agent suggested ${agentChoice.channel}/${agentChoice.delayHours}h but violated rules: ${veto.violations.join("; ")}. Falling back to ${fallback.channel}/${fallback.delayHours}h.`;
-            this.recordDecision(fallback);
-            return fallback;
+          if (vetoReason) {
+            console.warn(`[Policy] ⚠️ Agent choice clamped for ${input.caseId}: ${vetoReason}`);
           }
+
+          const decision: PolicyDecision = {
+            caseId: input.caseId,
+            channel: clampedChoice.channel,
+            delayHours: clampedChoice.delayHours,
+            escalationLevel: clampedChoice.escalationLevel,
+            discountIncentive: clampedChoice.discountIncentive,
+            decisionSource: vetoReason ? "agent_vetoed" : "agent",
+            narration: vetoReason ? `[CLAMPED] ${vetoReason}. Original: ${clampedChoice.narration}` : clampedChoice.narration,
+            allowedActions,
+            vetoReason,
+            decidedAt: new Date().toISOString(),
+            message: clampedChoice.message,
+            state: clampedChoice.state,
+            metadata: clampedChoice.metadata,
+            rag_context: ragContextIds,
+          };
+          this.recordDecision(decision);
+          return decision;
         }
       } catch (err) {
         console.error(`[Policy] Agent LLM error for ${input.caseId}:`, err);
@@ -536,6 +623,137 @@ export class PolicyService {
     const decision = applyBaselineRule(input, allowedActions);
     this.recordDecision(decision);
     return decision;
+  }
+
+  /**
+   * Handle a customer reply in a conversational turn.
+   */
+  async conversationalTurn(
+    caseId: string,
+    currentState: CaseState,
+    replyText: string,
+    channel: Channel,
+    allowedActions: AllowedActionSet
+  ): Promise<PolicyDecision> {
+    if (!this.llmCall) {
+      const fallback = applyBaselineRule(
+        { caseId, category: "unknown" as any, taxonomy: {} as any, amount: 0, retryCount: allowedActions.currentAttempt, recoverability: {} as any, isSubscription: false },
+        allowedActions
+      );
+      this.recordDecision(fallback);
+      return fallback;
+    }
+
+    const prompt = `You are a revenue recovery agent.
+Case ID: ${caseId}
+Current State: ${currentState}
+The customer just replied on ${channel}: "${replyText}"
+
+Your allowed maximum discount is ${allowedActions.maxDiscountPercent}%.
+Classify their intent and output EXACTLY ONE of the following JSON structures. Do not output anything else.
+
+If they promised to pay on a date:
+{"state": "PAUSED_PROMISE", "metadata": {"date": "YYYY-MM-DD", "reason": "...", "verbatim": "..."}, "message": "...", "delayHours": 0, "discountIncentive": 0, "channel": "${channel}", "narration": "..."}
+
+If they objected to the price (e.g. expensive):
+{"state": "INTERVENING", "metadata": {"objection": "expensive", "offeredDiscount": <0-${allowedActions.maxDiscountPercent}>}, "message": "...", "delayHours": 0, "discountIncentive": <discount>, "channel": "${channel}", "narration": "..."}
+
+If they said YES to a payment link:
+{"state": "INTERVENING", "metadata": {"intent": "generate_link"}, "message": "...", "delayHours": 0, "discountIncentive": <previous discount if any>, "channel": "${channel}", "narration": "..."}
+
+If they opted out (e.g. stop, don't message):
+{"state": "CLOSED_LOST", "metadata": {"reason": "opt_out"}, "message": "...", "delayHours": 0, "discountIncentive": 0, "channel": "${channel}", "narration": "..."}
+
+If they dispute the charge:
+{"state": "ESCALATED", "metadata": {"reason": "dispute_claim"}, "message": "...", "delayHours": 0, "discountIncentive": 0, "channel": "${channel}", "narration": "..."}
+
+If it is a question:
+{"state": "INTERVENING", "metadata": {"intent": "question"}, "message": "...", "delayHours": 0, "discountIncentive": 0, "channel": "${channel}", "narration": "..."}
+
+If hostile/abuse:
+{"state": "CLOSED_LOST", "metadata": {"reason": "hostile", "needsConfirmation": true}, "message": "...", "delayHours": 0, "discountIncentive": 0, "channel": "${channel}", "narration": "..."}
+
+If unclassifiable:
+{"state": "INTERVENING", "metadata": {"intent": "clarify"}, "message": "...", "delayHours": 0, "discountIncentive": 0, "channel": "${channel}", "narration": "..."}`;
+
+    try {
+      const llmResponse = await this.llmCall(prompt);
+      const agentChoice = parseAgentResponse(llmResponse);
+
+      if (agentChoice) {
+        const { decision: clampedChoice, vetoReason } = validateAgentDecision(
+          currentState,
+          agentChoice,
+          allowedActions
+        );
+
+        if (vetoReason) {
+          console.warn(`[Policy] ⚠️ Conversational turn clamped for ${caseId}: ${vetoReason}`);
+        }
+
+        const decision: PolicyDecision = {
+          caseId,
+          channel: clampedChoice.channel,
+          delayHours: clampedChoice.delayHours,
+          escalationLevel: clampedChoice.escalationLevel,
+          discountIncentive: clampedChoice.discountIncentive,
+          decisionSource: vetoReason ? "agent_vetoed" : "agent",
+          narration: vetoReason ? `[CLAMPED] ${vetoReason}. Original: ${clampedChoice.narration}` : clampedChoice.narration,
+          allowedActions,
+          vetoReason,
+          decidedAt: new Date().toISOString(),
+          message: clampedChoice.message,
+          state: clampedChoice.state,
+          metadata: clampedChoice.metadata
+        };
+        this.recordDecision(decision);
+        return decision;
+      }
+    } catch (err) {
+      console.error(`[Policy] Agent LLM error during conversational turn for ${caseId}:`, err);
+    }
+
+    const fallback = applyBaselineRule(
+      { caseId, category: "unknown" as any, taxonomy: {} as any, amount: 0, retryCount: allowedActions.currentAttempt, recoverability: {} as any, isSubscription: false },
+      allowedActions
+    );
+    this.recordDecision(fallback);
+    return fallback;
+  }
+
+  /**
+   * Produce copy for an already-authorized promise-follow-up. This method
+   * intentionally returns text only: it cannot select a state, discount,
+   * channel, or payment outcome. The Orchestrator remains responsible for
+   * all side effects and will replace the payment-link placeholder itself.
+   */
+  async composePromiseReminder(context: {
+    caseId: string;
+    customerName?: string;
+    amount: number;
+    promisedDate: string;
+    transcript: string[];
+  }): Promise<string> {
+    const fallback = `Namaste ji, aapne ${context.promisedDate} tak payment ka promise kiya tha. Aaj woh date aa gayi hai—kya aap abhi payment complete kar sakte hain? {{PAYMENT_LINK}}`;
+    if (!this.llmCall) return fallback;
+
+    try {
+      const response = await this.llmCall(`You are drafting a single, polite Hinglish payment reminder. The promise date is today.
+Customer: ${context.customerName || "Customer"}
+Amount due: ₹${context.amount}
+Promised date: ${context.promisedDate}
+Recent conversation excerpts: ${context.transcript.join(" | ").slice(-1200) || "none"}
+
+Write only the customer-facing message, maximum 400 characters. Do not claim payment was received, offer a discount, opt the customer out, change state, or add a URL. Include the literal placeholder {{PAYMENT_LINK}} exactly once.`);
+      const message = String(response || "").trim().slice(0, 400);
+      if (!message) return fallback;
+      return message.includes("{{PAYMENT_LINK}}")
+        ? message
+        : `${message.slice(0, 380)}\n\n{{PAYMENT_LINK}}`;
+    } catch (err) {
+      console.warn(`[Policy] Promise reminder generation failed for ${context.caseId}:`, err);
+      return fallback;
+    }
   }
 
   private recordDecision(decision: PolicyDecision): void {
@@ -636,7 +854,7 @@ function buildNarration(
     parts.push(`[${escalation.replace(/_/g, " ").toUpperCase()}]`);
   }
 
-  if (input.recoverability.timingHint.isPaydayWindow) {
+  if (input.recoverability?.timingHint?.isPaydayWindow) {
     parts.push("(payday window)");
   }
 

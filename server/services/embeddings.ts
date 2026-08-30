@@ -1,8 +1,8 @@
-import { dbUpsertEmbedding, dbFindSimilar } from "../core/db.js";
+import { dbUpsertCaseEmbedding, dbFindSimilar } from "../core/db.js";
 import { type RecoveryCase } from "./orchestrator.js";
 import { type TranscriptEntry } from "./telegram.js";
 
-const EMBEDDING_MODEL = "text-embedding-004";
+const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "gemini-embedding-001";
 const EMBEDDING_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:embedContent`;
 
 export interface SimilarCase {
@@ -16,7 +16,7 @@ export interface SimilarCase {
   similarity: number;
 }
 
-/** Embed text via Gemini text-embedding-004 */
+/** Embed text via Gemini gemini-embedding-001 */
 export async function embedText(text: string): Promise<number[]> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return []; // Graceful degradation
@@ -45,20 +45,19 @@ export async function embedText(text: string): Promise<number[]> {
 }
 
 /** Build a narrative string from a resolved case */
-export function buildCaseNarrative(caseData: RecoveryCase, transcript?: TranscriptEntry[]): string {
+export function buildCaseNarrative(caseData: RecoveryCase, transcript?: TranscriptEntry[] | string): string {
   let narrative = `Customer ${caseData.customerName || "Unknown"} (₹${caseData.amount}, ${caseData.declineCode || "unknown"}/${caseData.category || "unknown"}) was contacted via ${caseData.currentDecision?.channel || "unknown"}. `;
   
-  if (transcript && transcript.length > 0) {
+  if (typeof transcript === "string" && transcript.trim().length > 0) {
+    narrative += `Conversation summary: ${transcript.trim().replace(/\n+/g, " | ").slice(-800)}. `;
+  } else if (Array.isArray(transcript) && transcript.length > 0) {
     narrative += `Conversation summary: `;
     const msgs = transcript.filter(t => t.dir !== "system").map(t => `${t.dir === "in" ? "Cust" : "Agent"}: ${t.text}`);
-    // Take a small sample to avoid huge embeddings
     narrative += msgs.slice(-5).join(" | ");
   }
 
   narrative += ` After ${caseData.attemptCount} attempts, the case ended as ${caseData.state}.`;
-  
-  // Truncate to a reasonable length (~1000 chars) to keep embeddings focused
-  return narrative.slice(0, 1000);
+  return narrative.slice(0, 1500);
 }
 
 export async function embedAndStore(
@@ -73,9 +72,9 @@ export async function embedAndStore(
   }
 ): Promise<void> {
   const embedding = await embedText(narrative);
-  if (embedding.length === 0) return;
+  // Pass empty array through to allow dbUpsertCaseEmbedding to handle NULL fallback
 
-  await dbUpsertEmbedding(
+  await dbUpsertCaseEmbedding(
     caseId,
     metadata.category || "unknown",
     metadata.channel || "unknown",
@@ -92,7 +91,7 @@ export async function findSimilarCases(
   queryText: string,
   category?: string,
   limit = 3,
-  threshold = 0.65
+  threshold = 0.5
 ): Promise<SimilarCase[]> {
   const queryVec = await embedText(queryText);
   if (queryVec.length === 0) return []; // graceful fallback

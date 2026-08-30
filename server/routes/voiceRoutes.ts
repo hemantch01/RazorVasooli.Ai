@@ -4,7 +4,7 @@ import { generateGeminiVoiceResponse, generateHinglishVoiceScript } from "../ser
 
 export function registerVoiceRoutes(app: express.Express, _ctx: Record<string, any>): void {
 app.post("/api/voice/generate", async (req: Request, res: Response) => {
-  const { invoiceId, customerName = "Subscriber", amount = 24999, declineCode = "INSUFFICIENT_FUNDS", discountPercent = 5 } = req.body;
+  const { invoiceId, customerName = "Subscriber", amount = 501, declineCode = "INSUFFICIENT_FUNDS", discountPercent = 5 } = req.body;
 
   const result = await generateGeminiVoiceResponse({
     invoiceId: invoiceId || `inv_${Date.now().toString(36)}`,
@@ -21,7 +21,7 @@ app.post("/api/voice/generate", async (req: Request, res: Response) => {
 });
 
 app.post("/api/voice/script", (req: Request, res: Response) => {
-  const { customerName = "Subscriber", amount = 24999, declineCode = "INSUFFICIENT_FUNDS", discountPercent = 5 } = req.body;
+  const { customerName = "Subscriber", amount = 501, declineCode = "INSUFFICIENT_FUNDS", discountPercent = 5 } = req.body;
 
   const scriptResult = generateHinglishVoiceScript({
     invoiceId: `inv_${Date.now().toString(36)}`,
